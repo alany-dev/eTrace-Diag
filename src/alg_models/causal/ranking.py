@@ -52,6 +52,15 @@ class RootCauseRanker:
     ) -> list[RootCauseCandidate]:
         node_ids = data.node_ids
         anomalous = [m for m in anomalous_metrics if not m.startswith("_")]
+        # normalize: anomalous entries may be full node ids ("svc::agg") or bare
+        # metric names ("agg"); build both lookup sets so the skip/scoring below
+        # is convention-agnostic.
+        anom_ids = {m for m in anomalous if "::" in m}
+        anom_metrics = {m.split("::", 1)[1] if "::" in m else m for m in anomalous}
+
+        def _is_anomalous(nid: str) -> bool:
+            metric = nid.split("::", 1)[1]
+            return nid in anom_ids or metric in anom_metrics
 
         # directed lagged ancestry (candidate -> descendant)
         children: dict[str, list[CausalEdge]] = {}
@@ -87,8 +96,7 @@ class RootCauseRanker:
             rows = np.where(
                 obs & np.isfinite(vals) & (data.ts_ns >= window_start) & (data.ts_ns <= window_end)
             )[0]
-            metric = nid.split("::")[1]
-            if metric not in anomalous or rows.size == 0:
+            if not _is_anomalous(nid) or rows.size == 0:
                 continue
             # first row whose value deviates > 3 MAD from its window median
             med = float(np.median(vals[rows]))
@@ -105,14 +113,21 @@ class RootCauseRanker:
 
         candidates: list[RootCauseCandidate] = []
         for nid in node_ids:
-            metric = nid.split("::")[1]
-            entity = nid.split("::")[0]
-            if metric not in anomalous and not children.get(nid):
+            metric = nid.split("::", 1)[1]
+            entity = nid.split("::", 1)[0]
+            if not _is_anomalous(nid) and not children.get(nid):
                 continue  # skip non-anomalous, non-ancestor nodes
 
-            detector_contrib = incident.metric_scores.get(metric, 0.0)
+            detector_contrib = max(
+                incident.metric_scores.get(metric, 0.0),
+                incident.metric_scores.get(nid, 0.0),
+            )
             desc = descendants(nid)
-            ancestor_hit = sum(1 for m in anomalous if f"{m}" in {d.split('::')[1] for d in desc})
+            desc_metrics = {d.split("::", 1)[1] for d in desc}
+            ancestor_hit = sum(
+                1 for m in anomalous
+                if m in desc or (m.split("::", 1)[1] if "::" in m else m) in desc_metrics
+            )
             if anomalous:
                 ancestor_score = min(1.0, ancestor_hit / len(anomalous))
             else:

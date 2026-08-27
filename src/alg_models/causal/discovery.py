@@ -119,15 +119,20 @@ def _parcorr(x: np.ndarray, y: np.ndarray, z: np.ndarray):
     rx = residual(x, z)
     ry = residual(y, z)
     denom = np.sqrt(np.sum(rx**2) * np.sum(ry**2))
-    if denom == 0:
+    if denom == 0 or not np.isfinite(denom) or np.isnan(rx).any() or np.isnan(ry).any():
         return 0.0, 1.0, 0.0, 0.0, n
     r = float(np.sum(rx * ry) / denom)
     r = float(np.clip(r, -1 + 1e-12, 1 - 1e-12))
+    if not np.isfinite(r):
+        return 0.0, 1.0, 0.0, 0.0, n
     if n - k - 3 <= 0:
-        return r, 1.0, np.nan, np.nan, n
+        return r, 1.0, 0.0, 0.0, n
     zval = 0.5 * np.log((1 + r) / (1 - r))
     t = zval * np.sqrt(n - k - 3)
     p = float(2 * (1 - stats.norm.cdf(abs(t))))
+    if not np.isfinite(p):
+        p = 1.0
+    p = float(np.clip(p, 0.0, 1.0))
     se = 1.0 / np.sqrt(n - k - 3)
     ci_lo = float(np.clip(r - 1.96 * se, -1, 1))
     ci_hi = float(np.clip(r + 1.96 * se, -1, 1))
@@ -173,6 +178,19 @@ def _detect_level_shift(data: MultivarData) -> bool:
         if sd > 0 and abs(float(np.mean(xb)) - float(np.mean(xa))) > 3.0 * sd:
             return True
     return False
+
+
+
+def _safe_stat_p(r: float, p: float):
+    """Sanitize a partial-correlation statistic and p-value for CausalEdge:
+    non-finite/out-of-range values become 0.0 / None-safe 1.0."""
+    r = float(r)
+    p = float(p)
+    if not np.isfinite(r) or not -1 <= r <= 1:
+        r = 0.0
+    if not np.isfinite(p) or not 0 <= p <= 1:
+        p = 1.0
+    return r, p
 
 
 class PCMIParCorrLite:
@@ -290,8 +308,8 @@ class PCMIParCorrLite:
                         dst_entity_id=data.node_ids[v],
                         lag_ns=lag * self.sample_interval_ns,
                         edge_mark="directed",
-                        statistic=r,
-                        p_value=p,
+                        statistic=_safe_stat_p(r, p)[0],
+                        p_value=_safe_stat_p(r, p)[1],
                         confidence_interval=(lo, hi),
                         stability=1.0,
                         evidence_level="strong",
@@ -321,8 +339,8 @@ class PCMIParCorrLite:
                     dst_entity_id=data.node_ids[b],
                     lag_ns=0,
                     edge_mark="undirected",
-                    statistic=r,
-                    p_value=p,
+                    statistic=_safe_stat_p(r, p)[0],
+                    p_value=_safe_stat_p(r, p)[1],
                     confidence_interval=(lo, hi),
                     stability=1.0,
                     evidence_level="strong",
@@ -415,8 +433,8 @@ class TigramitePCMCIPlus:
                             dst_entity_id=data.node_ids[j],
                             lag_ns=tau * data.sample_interval_ns,
                             edge_mark=mark,
-                            statistic=v,
-                            p_value=p,
+                            statistic=_safe_stat_p(v, p)[0],
+                            p_value=_safe_stat_p(v, p)[1],
                             confidence_interval=None,
                             stability=1.0,
                             evidence_level="strong",
