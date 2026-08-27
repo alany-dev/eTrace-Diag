@@ -1,0 +1,7 @@
+{
+ "incident_id": "inc-390000000000-510000000000-disk.io_wait-e9b4f504",
+ "candidate_id": "host::disk.io_wait",
+ "baseline": 5.0,
+ "high": 12.0,
+ "dry_run": true
+}
