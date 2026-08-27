@@ -1,0 +1,47 @@
+# Smoke-test configuration — deterministic, tiny, CPU-only.
+# Calibration sources are recorded in every ModelCard (calibration_basis);
+# thresholds are derived ONLY from train/validation splits, never test labels.
+
+seed: 7
+
+split:
+  train_frac: 0.6
+  val_frac: 0.2
+  test_frac: 0.2
+
+detector:
+  name: edge_cascade
+  window_ns: 60000000000      # 60 s
+  stride_ns: 30000000000      # 30 s
+  low_freq: 3
+  n_fft: 16
+  event_pot_quantile: 0.99
+  event_pot_multiplier: 1.5
+  trend_pot_quantile: 0.99
+  trend_pot_multiplier: 1.5
+  confidence_threshold: 0.6
+  max_missing_frac: 0.5
+  drift_residual_z: 1.5
+
+causal:
+  tau_max_s: 5
+  alpha_level: 0.05
+  fdr_method: bh
+  min_edge_stability: 0.6
+  candidate_hop: 2
+  background_pre_s: 60
+  background_post_s: 60
+  stability_bootstraps: 30
+  rank_weights:
+    detector: 0.25
+    ancestor: 0.25
+    temporal: 0.20
+    stability: 0.15
+    effect: 0.10
+    confounding: 0.05
+
+budget:
+  max_window_ms: 50
+  max_rss_mb: 200
+  max_cpu_pct: 5
+  max_bandwidth_kbps: 16

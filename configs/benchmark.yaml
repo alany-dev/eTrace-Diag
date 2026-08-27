@@ -1,0 +1,80 @@
+# Benchmark configuration — Model 1 + Model 2 experiment settings.
+# All thresholds, split points, and hyperparameters are frozen here and
+# traceable to train/validation only. Test labels never participate.
+
+seed: 7
+
+split:
+  train_frac: 0.6
+  val_frac: 0.2
+  test_frac: 0.2
+
+detector:
+  name: edge_cascade
+  window_ns: 60000000000      # 60 s
+  stride_ns: 30000000000      # 30 s
+  low_freq: 6
+  n_fft: 64
+  event_pot_quantile: 0.99
+  event_pot_multiplier: 1.5
+  trend_pot_quantile: 0.99
+  trend_pot_multiplier: 1.5
+  confidence_threshold: 0.6
+  max_missing_frac: 0.5
+  drift_residual_z: 1.5
+
+causal:
+  tau_max_s: 5
+  alpha_level: 0.05
+  fdr_method: bh
+  min_edge_stability: 0.6
+  candidate_hop: 2
+  background_pre_s: 60
+  background_post_s: 60
+  stability_bootstraps: 30
+  rank_weights:
+    detector: 0.25
+    ancestor: 0.25
+    temporal: 0.20
+    stability: 0.15
+    effect: 0.10
+    confounding: 0.05
+
+budget:
+  max_window_ms: 50
+  max_rss_mb: 200
+  max_cpu_pct: 5
+  max_bandwidth_kbps: 16
+
+datasets:
+  smd:
+    source: OmniAnomaly official ServerMachineDataset
+    # download script records manifest + checksum; data never committed
+    manifest: data/manifests/smd.json
+    machines: 28
+    dims: 38
+    labels: per-point + interpretation_label
+    primary: host-scenario detection
+  psm:
+    source: PSM (eBay)
+    manifest: data/manifests/psm.json
+  kpi:
+    source: KPI AD Challenge
+    manifest: data/manifests/kpi.json
+  nab:
+    source: Numenta Anomaly Benchmark
+    manifest: data/manifests/nab.json
+    profiles: [standard, reward_low_fp, reward_low_fn]
+  rcaeval:
+    source: https://github.com/phamquiluan/RCAEval
+    manifest: data/manifests/rcaeval.json
+    suites: [re1, re2, re3]
+    metrics: [ac1, ac3, avg5]
+  aiops2020:
+    source: https://github.com/NetManAIOps/AIOps-Challenge-2020-Data
+    license: non-commercial-research-required
+    status: blocked-until-license
+
+budget_report:
+  output_dir: results
+  include: [gate_hit_rate, second_ring_trigger_rate, quality_degradation]
