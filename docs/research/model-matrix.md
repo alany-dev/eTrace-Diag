@@ -170,3 +170,25 @@ over-connects at every lag under the level shift.
   this network (`huggingface.co` times out); the runner substitutes the
   deterministic synthetic SCM and records the substitution in `results`.
 - **AIOps 2020** still requires a non-commercial research license; unchanged.
+
+## Real-data runs (user-provided archives, 2026-08-27)
+
+### RCAEval RE1 (真实 735-case 数据，服务级聚合)
+
+`uv run python -m experiments.rcaeval --data data/rca_eval --suite RE1 --limit 20`
+
+| System | CausalGraphRCA AC@1 / AC@3 / Avg@5 | 相关基线 AC@1 / AC@3 / Avg@5 |
+|---|---|---|
+| RE1-OB (Online Boutique) | 0.55 / 0.65 / 0.644 | 0.75 / 1.0 / 0.875 |
+| RE1-SS (Sock Shop) | 0.35 / 0.65 / 0.562 | 1.0 / 1.0 / 1.0 |
+| RE1-TT (TrainTicket) | 0.0 / 0.4 / 0.199 | 0.0 / 0.0 / 0.0 |
+
+TrainTicket 两类方法皆 0%（root_cause_service 命名与指标列前缀不一致、故障非明显
+电平漂移），为真实困难信号，未做调优掩盖。
+
+### AIOps 2020 预赛（用户提供 archive，非商业科研许可）
+
+`uv run python -m experiments.aiops2020 --archive data/AIOps挑战赛2020预赛数据.zip --object docker`
+
+docker 故障子集 hit@3≈0.22 / hit@1≈0.09；catalog log_time 与 metric timestamp 是
+偏移时钟域，网络类故障 kpi 为空、100+ 号走揭晓机制，均已记录为限制。
