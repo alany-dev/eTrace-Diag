@@ -225,8 +225,21 @@ class CausalGraphRCA:
                 x_baseline=baseline, x_high=high,
                 contemp_edges=contemp_edges,
             )
+        # Graph-density driven rank weights: when the discovered graph is dense
+        # (ancestor-centrality unreliable), shift weight onto the residual/
+        # deviation evidence. Config-fixed weights still override; otherwise the
+        # base weights are blended with density.
+        weights = self.rank_weights or None
+        if weights is None and getattr(result, "density", 0.0) > 0.4:
+            d = min(1.0, result.density)
+            det = 0.25 + 0.35 * d
+            anc = 0.25 * (1.0 - d)
+            fixed = {"temporal": 0.20, "stability": 0.15, "effect": 0.10, "confounding": 0.05}
+            total = det + anc + sum(fixed.values())
+            weights = {"detector": det / total, "ancestor": anc / total,
+                       **{k: v / total for k, v in fixed.items()}}
         ranker = RootCauseRanker(
-            weights=self.rank_weights or None,
+            weights=weights,
             min_edge_stability=self.min_edge_stability,
             alpha_level=self.alpha_level,
         )

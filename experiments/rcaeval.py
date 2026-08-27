@@ -152,6 +152,9 @@ def run(args) -> dict:
 
     cfg = yaml.safe_load(open(args.config))
     cfg["causal"]["stability_bootstraps"] = args.bootstrap  # light discovery for the sweep
+    # let CausalGraphRCA auto-blend rank weights by discovered-graph density
+    # (dense full-mesh graph => deviation/residual dominates, not centrality)
+    cfg["causal"].pop("rank_weights", None)
 
     rca_runs, corr_runs = [], []
     t0 = time.time()

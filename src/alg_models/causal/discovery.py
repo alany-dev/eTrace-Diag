@@ -451,7 +451,24 @@ class DiscoveryResult:
     total_points: int
     bootstrap_runs: int
     pruned_candidates: int
+    density: float = 0.0
     limitations: list[str] = field(default_factory=list)
+
+
+
+
+def _edge_density(edges: list[CausalEdge], n_nodes: int) -> float:
+    """Distinct (src, dst) pairs with ≥1 strong directed edge, normalized by
+    the max possible pairs. A dense discovered graph means ancestor-centrality
+    is unreliable (everything reaches everything) and the residual/deviation
+    evidence should dominate the rank."""
+    pairs = {
+        (e.src_entity_id, e.dst_entity_id)
+        for e in edges
+        if e.edge_mark == "directed" and e.lag_ns > 0 and e.evidence_level == "strong"
+    }
+    max_pairs = max(1, n_nodes * (n_nodes - 1))
+    return min(1.0, len(pairs) / max_pairs)
 
 
 class PCMCIPlusDiscovery:
@@ -595,6 +612,7 @@ class PCMCIPlusDiscovery:
                 f"stability bootstrap {runs} runs; edges below "
                 f"min_edge_stability={self.min_edge_stability} marked weak"
             )
+        density = _edge_density(edges, len(data.node_ids))
         return DiscoveryResult(
             edges=edges,
             backend=backend,
@@ -602,5 +620,6 @@ class PCMCIPlusDiscovery:
             total_points=total,
             bootstrap_runs=runs,
             pruned_candidates=candidate_graph.pruned_edge_count,
+            density=density,
             limitations=list(self.limitations),
         )
