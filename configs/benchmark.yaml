@@ -78,7 +78,7 @@ datasets:
     metrics: [ac1, ac3, avg5]
   torai:
     source: https://doi.org/10.6084/m9.figshare.31925976
-    manifest: data/torai/build_manifest.json
+    manifest: null  # blocked: Figshare download behind AWS WAF; no derived substitute
     suites: [torai-ob, torai-ss, torai-tt]
     metrics: [ac1, ac3, ac5, avg5]
   aiops2020:

@@ -90,10 +90,13 @@ uv run python -m experiments.run_torai \
     --methods torai,rcd_only,baro,correlation
 ```
 
-1. Data loading: TORAI-format directories under `data/torai/torai-{OB,SS,TT}`.
-   The window is ± 10 minutes around `inject_time` (20 minutes total, matching
-   RCAEval `--length 20`). The normal side is the tail half of the pre-inject
-   segment; the anomalous side is the head half of the post-inject segment.
+1. Data loading: TORAI-format directories under `data/torai/torai-{OB,SS,TT}`,
+   obtained ONLY from the official Figshare archive
+   (DOI 10.6084/m9.figshare.31925976; see `experiments/download_torai_data.py`).
+   No derived/fabricated dataset is used (policy 2026-08-29). The window is
+   ± 10 minutes around `inject_time` (20 minutes total, matching RCAEval
+   `--length 20`). The normal side is the tail half of the pre-inject segment;
+   the anomalous side is the head half of the post-inject segment.
 2. Ground truth is parsed from the directory path: `{service}_{fault}/{run}`.
    The service name is the first component before `_`; the fault type is the
    remaining suffix.

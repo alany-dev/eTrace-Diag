@@ -55,9 +55,9 @@ def main(argv: list[str] | None = None) -> int:
             f"  1. open {FIGSHARE_ARTICLE}\n"
             "  2. pass the challenge, click Download, save the zip\n"
             f"  3. place it at {zip_path}\n"
-            "then re-run this command. Fallback: "
-            "`uv run python -m experiments.torai_data` derives the dataset from the "
-            "local RE2 snapshot (recorded as source=derived-from-re2)."
+            "then re-run this command. No derived/fabricated substitute is "
+            "created (policy 2026-08-29); TORAI reproduction waits for the "
+            "official archive."
         )
         return 2
 

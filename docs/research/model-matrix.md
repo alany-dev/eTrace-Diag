@@ -132,65 +132,38 @@ Preprocessing differences recorded (not test-tuned): this project's detectors us
 sample); Anomaly Transformer uses `win_size=100` (1 h 40 min) with train-fit
 standardization. Literature scores are never restated as this project's results.
 
-### Model 2 RCA — TORAI reproduction (RCAEval torai-ob, derived-from-re2)
+### Model 2 RCA — TORAI reproduction (not run: official dataset unavailable)
+
+The TORAI multi-source benchmark is published on Figshare
+(DOI 10.6084/m9.figshare.31925976, torai-OB/SS/TT). This host cannot download
+it (AWS WAF JS challenge blocks the ndownloader endpoint). Per project policy,
+NO derived/fabricated substitute is used: the earlier `derived-from-re2`
+re-aggregation of the local RCAEval RE2 parquet was a mistake and has been
+removed (`experiments/torai_data.py`, `data/torai/`, `results/torai/`). The
+official RCAEval datasets (RE1/RE2/RE3, 735 cases) remain the primary real-data
+benchmark; TORAI faithful reproduction on the official torai-* datasets is
+pending until the Figshare archive is obtainable.
 
 `uv run python -m experiments.run_torai --dataset torai-ob --variant faithful --seeds 7,11,19`
-
-Coarse Avg@5 per fault (3 seeds, 90 cases); paper reference = RCAEval README
-(torai-ob, original Figshare dataset). Runtime per case (wall clock):
-
-| Metric | faithful | improved | paper (README torai-ob) |
-|---|---|---|---|
-| CPU | 0.807 | 0.844 | 0.96 |
-| MEM | 0.918 | 0.956 | 0.93 |
-| DISK | 0.933 | 0.978 | 1.0 |
-| SOCKET | 0.807 | 0.830 | 0.93 |
-| DELAY | 0.845 | 0.911 | 0.8 |
-| LOSS | 0.826 | 0.889 | 0.84 |
-| **AVERAGE** | **0.896** | **0.901** | ~0.91 |
-| latency p50/p95 (s/case) | 0.96 / 2.06 | 0.27 / 0.55 | — |
-| peak RSS (MB) | 218 | 216 | — |
-
-Baselines (faithful, seed 7): rcd_only 0.893, baro 0.656, correlation 0.900.
-Derived-from-re2 threshold (AVERAGE ≥ 0.75, same-direction ordering) met:
-AVERAGE 0.896, DELAY/LOSS exceed the paper reference. The improved variant
-(standard scaler + diag GMM + BIC≤10 + quantile discretization + native
-resolution trim) keeps Avg@5 ≥ faithful on this dataset while cutting p95
-latency ~73% (2.06 → 0.55 s).
-
-
-Full three-dataset faithful vs improved (3 seeds, 90 cases each, coarse Avg@5):
-
-| Dataset | faithful avg5 | improved avg5 | faithful p95 (s) | improved p95 (s) |
-|---|---|---|---|---|
-| torai-ob | 0.896 | 0.901 | 2.06 | 0.55 |
-| torai-ss | 0.925 | 0.911 | 2.34 | 0.94 |
-| torai-tt | 0.785 | 0.803 | 13.90 | 2.39 |
-
-Recorded honestly (user policy 2026-08-29: improvements are exploratory, no
-forced acceptance): improved ≥ faithful on ob/tt, −0.014 on ss; p95 latency
-cut 60–83% on all three datasets. Paper reference per fault only exists for
-torai-ob (table above); ss/tt reference values not published in the README.
+(requires `data/torai/torai-OB/...` from the official Figshare zip, see
+`experiments/download_torai_data.py` for the acquisition procedure).
 
 ### Blocked
 
 - **OmniAnomaly** official code is TensorFlow 1.x (`tfsnippet`) and cannot run on
   Python 3.11; recorded as blocked — no paper-equivalent VAE adapter fabricated.
 - **AIOps 2020** still requires a non-commercial research license; unchanged.
-- The authoritative TORAI Figshare dataset is blocked by AWS WAF for direct
-  download from this host; the equivalent layout is derived from the local
-  RCAEval RE2 parquet snapshot (`experiments/torai_data.py`, manifest records
-  `source: derived-from-re2`). Reproduction thresholds for derived data:
-  AVERAGE Avg@5 ≥ 0.75 with same-direction ordering.
+- **TORAI Figshare dataset**: AWS WAF blocks the download from this host; no
+  derived/fabricated substitute is created (policy 2026-08-29).
 
 ## Real-data runs (user-provided archives, 2026-08-27)
 
-### RCAEval RE2 (TORAI-derived, 90-case per system)
+### RCAEval RE1/RE2/RE3 (official parquet, 735 cases)
 
-`uv run python -m experiments.run_torai --dataset torai-ob|torai-ss|torai-tt --variant faithful --seeds 7,11,19`
-
-See the TORAI reproduction table above (per-fault Avg@5, coarse + fine, with
-p50/p95 per-case latency recorded in `results/torai/*.json`).
+The official RCAEval real-data benchmark (`data/rca_eval/cases.parquet` + per-case
+`metrics.parquet`/`logs.parquet`/`traces.parquet`) is the primary real-data
+suite for Model 2 evaluation. TORAI faithful reproduction on the official
+torai-* Figshare layout is pending until that archive is obtainable.
 
 ### AIOps 2020 预赛（用户提供 archive，非商业科研许可）
 

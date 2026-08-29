@@ -25,8 +25,9 @@
 evaluation-protocol）。
 
 TORAI 复现：`experiments/run_torai.py --dataset torai-ob --variant faithful --seeds 7,11,19`
-（数据由本地 RCAEval RE2 快照按 TORAI §3.1 派生，见 `experiments/torai_data.py`；
-Figshare 官方数据被 AWS WAF 拦截，记录在 `data/torai/build_manifest.json`）。
+（需先按 `experiments/download_torai_data.py` 从 Figshare 获取官方
+torai-OB/SS/TT 数据到 `data/torai/`；Figshare 下载被 AWS WAF 拦截，
+官方数据当前不可得 → 不做派生替代，TORAI 复现待数据可获取后执行）。
 
 ## 安装与验证
 
