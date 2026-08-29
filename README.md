@@ -1,1 +1,150 @@
 # eTrace-Diag
+
+基于 eBPF 的系统异常观测与根因定位工具（社区赛题）。轻量级、低开销，面向 CPU 异常占用、I/O 延迟抖动、内存抖动/OOM 风险、锁竞争、高频/高耗时系统调用热点五类典型异常场景，实时观测、指标采集、事件关联，并将结构化证据交由异常检测 / 因果推断模型（WebSocket，预留 ONNX 端口）完成根因诊断。
+
+eBPF-based system anomaly observation and root-cause diagnosis tool. Low-overhead, CO-RE, targets CPU saturation, I/O latency jitter, memory pressure/OOM risk, lock contention, and syscall hotspots.
+
+> 当前为**数据采集**里程碑：产出结构化指标/事件/调用栈证据文件；诊断结论由外部模型给出（本仓库提供 WS 协议客户端与 mock 服务端）。
+> 详细设计见 [`docs/architecture.md`](docs/architecture.md)，实测开销见 [`docs/overhead-baseline-20260828.md`](docs/overhead-baseline-20260828.md)。
+
+---
+
+## 特性
+
+- **两阶段采集**：BASE 常驻基线（主机指标 + 飞行记录器 + 异常检测特征）→ DEEP 异常后细粒度证据（on/off-CPU 画像、syscall 热点、锁竞争、run-queue 延迟、热点文件 I/O）。
+- **内核侧 top-k 过滤**：唯一 top-k（进程表 + 每进程线程表），所有细粒度 hook 在 BPF 内按 `targets` map 门控，非目标数据不离开内核。
+- **硬件自适应预算**：按 online CPU、cgroup `cpu.max` 配额、cpuset、内存、飞行记录器环形容量推导线程预算（`auto_scale`）。
+- **滑窗抗抖动**：`window_seconds` 滑窗计分 + 进程级滞回，指标突变不造成成员抖动、证据序列连续。
+- **低开销**：计数器全为内核累积 + 主机侧 delta；栈经 `stack_id` 去重；直方图压缩传输。自开销逐程序精确记录（`bpf_stats.jsonl`）。
+- **热配置**：SIGHUP 重载全部采样/窗口/top-k 参数；SIGUSR1/2 手动切换阶段（无模型基准测试用）。
+- **多内核适配**：openKylin 6.6（openKylin 目标）/ 5.15 降级路径（per-CPU 采样器、mutex kprobe、无 percpu-lookup 助手），x86_64 / arm64。
+
+## 架构
+
+```
+main.cpp ── CLI/信号/初始 config
+RunCollector (app.cpp) ── 单线程 tick 调度（host / feature / topk / deep / overhead）
+├── EbpfManager    骨架 open/load/attach、map 访问、目标表编辑、自开销统计
+├── TargetSelector 两档 top-k（进程表 + 每进程线程）+ 滑窗计分 + 硬件自适应
+├── DeepCollector  DEEP 阶段：深链 attach、pre/post 窗口、热点结果 dump
+├── PhaseManager   BASE/DEEP 状态机（异常起止/去抖/合并）
+├── HostMetrics    /proc 主机指标
+├── OutputWriter   会话目录 + JSON Lines / folded 输出
+└── ModelClient    ws_model_client | onnx（占位）
+```
+
+- 内核侧：单 CO-RE 对象 `bpf/etrace.bpf.c`（`tp_btf`/`kprobe`/`perf_event`/`iter/task`/`fentry` 挂载），完整清单见 `docs/architecture.md §3`。
+- 数据流与输出文件见 `docs/architecture.md §6`。
+
+## 环境要求
+
+| 项 | 要求 |
+|---|---|
+| 操作系统 | openKylin（目标）/ 主流 Linux（开发验证于 5.15 与 6.6） |
+| 内核 | ≥ 5.15（目标 6.6+），`CONFIG_DEBUG_INFO_BTF=y`（缺失则启动 fail-fast 并提示） |
+| 权限 | root，或 `CAP_BPF` + `CAP_PERFMON` + `CAP_SYS_ADMIN` |
+| 架构 | x86_64 / arm64 |
+| 构建工具 | cmake ≥ 3.16、clang（BPF target，llvm 14+）、bpftool、libbpf（系统包或自动构建）、libelf、zlib |
+| 运行时（可选） | stress-ng、fio（复现场景）、python3（mock 模型） |
+
+## 构建
+
+```bash
+./scripts/build.sh
+# 产物：build/etrace-diag、build/bpf/etrace.bpf.o、build/bpf/etrace.skel.h
+```
+
+- 优先使用系统 libbpf（pkg-config），否则自动从内核 `tools/lib/bpf` 静态构建。
+- 配置期自动探测内核特性（`bpf_timer`、`lock:contention_begin/end`、`bpf_map_lookup_percpu_elem`）并选择对应实现路径。
+- 构建期测试：`config_probe`（配置解析/夹取校验）。
+
+## 使用
+
+```bash
+# 参数一览
+./build/etrace-diag --help
+
+# BASE 冒烟（60s）
+sudo ./build/etrace-diag --output-dir ./out --run-seconds 60 --config config/default.json
+
+# 手动触发 DEEP（无模型基准）：运行后
+kill -USR1 <pid>   # 进入 DEEP
+kill -USR2 <pid>   # 返回 BASE
+kill -INT  <pid>   # 干净退出（DEEP 先 finalize）
+```
+
+输出会话目录 `out/<YYYYmmdd-HHMMSS>_<pid>/`：
+
+```
+base_host.jsonl        主机指标（cpu/loadavg/meminfo/vmstat/PSI/diskstats/进程表） 1s
+base_anomaly.jsonl     异常特征向量（发给模型） 1s
+targets.log            top-k 成员 join/leave（tgid、score、进程 rank）
+bpf_stats.jsonl        每个 BPF 程序 run_cnt/run_time_ns（内核开销精确归属） 1s
+proc_overhead.jsonl    用户态 CPU/切换/缺页 + RSS/HWM 1s
+io_devices.txt / memory_events.txt   设备 IO / 内存事件
+deep/<N>/              每次异常：
+  pre_series.jsonl / post_series.jsonl  飞行记录器窗口（100ms/20ms）
+  host_series.jsonl    DEEP 期间主机序列
+  on_cpu.folded / off_cpu.folded       折叠调用栈
+  syscall_hotspot.txt / lock_contention.txt / runq_latency.txt / io_files.txt
+  meta.json / summary.txt
+```
+
+## 配置
+
+全部参数见 `docs/architecture.md §2`（`config/default.json` ↔ `include/etrace_diag/config.h`）。要点：
+
+- **加载优先级**：CLI > `ETRACE_DIAG_*` 环境变量 > `--config` JSON > 内置默认。
+- **热重载**：SIGHUP 重读配置文件，`sample.*` / `window.*` / `targets.*` 下一 tick 生效。
+- **top-k 关键项**：`auto_scale`（硬件自适应）、`max_targets`（线程预算上限）、`per_proc_threads`（每进程线程数）、`concurrency_factor`（每逻辑核关注线程数）、`eval_interval_ms`（重评周期）、`window_seconds`（滑窗跨度）。
+- **自开销**：`misc.enable_bpf_stats=true` 时启动置 `kernel.bpf_stats_enabled=1`，逐程序记录执行次数/耗时，退出恢复原值。
+
+## 复现与验证
+
+```bash
+# 五个场景（赛题要求 §46-49）：每个脚本运行收集器、触发 DEEP、断言产物
+./scripts/scenario_cpu.sh
+./scripts/scenario_io.sh
+./scripts/scenario_mem.sh
+./scripts/scenario_lock.sh
+
+# 阶段切换测试（mock 模型，触发一次异常）
+python3 scripts/mock_model.py --trigger-once &
+sudo ./build/etrace-diag --output-dir ./out --config config/default.json
+```
+
+验证断言：BASE ≥1 行/s、DEEP 窗口时间戳 ∈ `[anomaly_start−pre, anomaly_start+post]`、热点文件非空、top-k 成员出现在 `targets.log`、自开销文件逐秒增长。
+
+## 实测开销（2026-08-28，5.15 共享机，仅 BPF 程序体）
+
+| 阶段 | 内核 BPF 本体 | 用户态进程 |
+|---|---|---|
+| BASE | ≈ 17% 单核 | ≈ 11% 单核 |
+| DEEP | ≈ 50% 单核 | ≈ 20% 单核 |
+
+口径与逐程序明细见 [`docs/overhead-baseline-20260828.md`](docs/overhead-baseline-20260828.md)；系统净影响（评审口径）需 `perf stat -a` 加载/不加载对照。6.6 目标机上 `snapshotter` 走 bpf_timer 求和模式，成本显著低于 5.15 降级路径。
+
+## 已知限制
+
+- `file_open_path` 的路径缓存为「最近一次 open」，同一 inode 多路径退化为最近路径；open 早于入榜时退化为 basename。
+- `mm->rss` 在 6.6 为 percpu 计数器（BPF 不可读），RSS 仅对目标进程主机侧补读。
+- ONNX 适配器为占位（`model.adapter=onnx` 会抛未链接异常），当前推理走 WS。
+- 飞行记录器环形容量编译期固定（`RING_CAP=32768`），`ring_backlog_seconds` 只能下调不能超容量上调。
+
+## 目录结构
+
+```
+bpf/                内核 BPF 程序（CO-RE 单对象）
+cmake/              libbpf / bpftool 构建适配
+config/             默认配置
+include/etrace_diag/ 公共头（config/metrics/output_writer/model_client/app）
+src/                C++ 实现（collect/ model/ output/ 及主循环）
+scripts/            构建、运行、mock 模型、场景复现
+tests/              构建期测试（config_probe）
+third_party/        vendored 单头 nlohmann/json
+docs/               架构说明 + 开销基线
+```
+
+## 许可
+
+见赛题说明（`赛题要求.md`）。本项目为竞赛作品，开源技术栈（C++20 / libbpf / eBPF / nlohmann-json）。
