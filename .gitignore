@@ -1,0 +1,10 @@
+build/
+out/
+out_*/
+*.o
+*.a
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+_deps/
