@@ -1,0 +1,63 @@
+{
+  "sample": {
+    "base_host_interval_ms": 1000,
+    "base_feature_interval_ms": 1000,
+    "fine_interval_ms": 100,
+    "deep_fine_interval_ms": 20,
+    "deep_dump_interval_ms": 1000,
+    "profile_freq_hz": 99,
+    "offcpu_sample_rate": 16,
+    "iofile_sample_rate": 4,
+    "overhead_interval_ms": 1000
+  },
+  "window": {
+    "pre_anomaly_seconds": 60,
+    "post_anomaly_seconds": 180,
+    "ring_backlog_seconds": 90,
+    "end_debounce_samples": 3,
+    "end_grace_seconds": 5
+  },
+  "targets": {
+    "max_targets": 64,
+    "auto_scale": true,
+    "min_targets": 4,
+    "per_proc_threads": 4,
+    "concurrency_factor": 2.0,
+    "eval_interval_ms": 5000,
+    "window_seconds": 30,
+    "enter_rank": 12,
+    "leave_rank": 20,
+    "hold_periods": 3,
+    "min_residency_seconds": 10,
+    "pinned": [],
+    "weights": {
+      "cpu": 0.35,
+      "switch": 0.15,
+      "io": 0.20,
+      "fault": 0.15,
+      "lock": 0.15
+    }
+  },
+  "model": {
+    "anomaly": {
+      "url": "ws://127.0.0.1:9001/anomaly",
+      "timeout_ms": 5000
+    },
+    "causal": {
+      "url": "ws://127.0.0.1:9002/causal",
+      "timeout_ms": 30000
+    },
+    "adapter": "ws"
+  },
+  "output": {
+    "dir": "out",
+    "metrics_format": "jsonl",
+    "profile_format": "folded"
+  },
+  "misc": {
+    "log_level": "info",
+    "categories": ["cpu", "io", "memory", "lock", "syscall"],
+    "pid_filter": 0,
+    "enable_bpf_stats": true
+  }
+}
