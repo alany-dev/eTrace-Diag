@@ -6,7 +6,12 @@ sentence-by-sentence and falls back to the template.
 from __future__ import annotations
 
 from alg_models.interactive.explainer import EvidenceNarrator
-from alg_models.schemas import CausalReport, CausalEdge, IncidentWindow, RootCauseCandidate
+from alg_models.schemas import (
+    CausalReport,
+    IncidentWindow,
+    RootCauseCandidate,
+    SymptomCluster,
+)
 
 
 def _report() -> CausalReport:
@@ -16,21 +21,15 @@ def _report() -> CausalReport:
         metric_scores={"cpu.utilization": 0.9}, directions={"cpu.utilization": "up"},
         model_version="0.1.0",
     )
-    edge = CausalEdge(
-        edge_id="e:host::disk.io_wait->process::process.io_wait@lag3",
-        src_entity_id="host::disk.io_wait", dst_entity_id="process::process.io_wait",
-        lag_ns=3_000_000_000, statistic=0.9, p_value=0.001,
-        stability=0.8, evidence_level="strong",
-    )
     cand = RootCauseCandidate(
-        entity_id="host::disk.io_wait", rank=1, score=0.7,
-        direction="up", identifiability="identified", effect_estimate=3.5,
-        effect_interval=(2.0, 5.0),
-        evidence_edge_ids=["e:host::disk.io_wait->process::process.io_wait@lag3"],
+        entity_id="adservice", rank=1, score=0.7, direction="up",
+        severity={"metric": 0.8}, evidence_indicators=["adservice_cpu"],
+        cluster_id=0,
     )
+    cluster = SymptomCluster(cluster_id=0, members=["adservice", "cartservice"], cluster_score=0.9)
     return CausalReport(
         incident_id="i1", window=inc, anomalous_metrics=["cpu.utilization"],
-        edges=[edge], candidates=[cand], model_version="0.1.0",
+        candidates=[cand], clusters=[cluster], model_version="0.1.0",
     )
 
 
@@ -38,35 +37,41 @@ def test_template_backend_is_deterministic():
     narrator = EvidenceNarrator()
     text = narrator.narrate(_report())
     assert "Incident i1" in text
-    assert "host::disk.io_wait" in text
+    assert "adservice" in text
+    assert "adservice_cpu" in text  # evidence indicator appears
+    assert "symptom clusters: 1" in text
     assert narrator.narrate(_report()) == text  # deterministic
 
 
-def test_sentence_with_nonexistent_edge_id_rejected():
+def test_sentence_with_nonexistent_reference_rejected():
     def bad_llm(report):
         return (
-            "Incident i1. e:does::not-exist@lag0 caused the failure. "
-            "host::disk.io_wait is ranked 1."
+            "Incident i1. nonexistent_service_cpu drove the failure. "
+            "adservice is ranked 1."
         )
     narrator = EvidenceNarrator(llm_renderer=bad_llm)
     text = narrator.narrate(_report())
-    # the unsupported sentence is replaced by the template — the fake edge id
-    # must never appear in the final output
-    assert "does::not-exist" not in text
-    assert "ranked 1" not in text
+    # the unsupported sentence (citing a non-existent indicator) is replaced
+    # by the template — the fake id must never appear in the final output
+    assert "nonexistent_service_cpu" not in text
     # the valid sentence (with a real entity id) survives
-    assert "host::disk.io_wait is ranked 1" not in text
+    assert "adservice is ranked 1" not in text
 
 
-def test_wrong_direction_rejected_for_unidentified_candidate():
+def test_sentence_without_reference_rejected():
+    def bare_llm(report):
+        return "The system experienced degraded performance."
+    narrator = EvidenceNarrator(llm_renderer=bare_llm)
+    text = narrator.narrate(_report())
+    assert "degraded performance" not in text
+
+
+def test_wrong_direction_rejected():
     def wrong_dir(report):
-        return (
-            "host::cpu.utilization caused the anomaly (decreased load). "
-            "host::disk.io_wait effect 3.5."
-        )
+        return "adservice caused the anomaly (decreased load)."
     narrator = EvidenceNarrator(llm_renderer=wrong_dir)
     text = narrator.narrate(_report())
-    # direction-claim + causal claim on a not-identified candidate is rejected
+    # direction-claim contradicts candidate direction ("up") — rejected
     assert "caused the anomaly" not in text
 
 

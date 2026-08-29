@@ -1,4 +1,4 @@
-# Benchmark configuration — Model 1 + Model 2 experiment settings.
+# Benchmark configuration — Model 1 + Model 2 (TORAI) experiment settings.
 # All thresholds, split points, and hyperparameters are frozen here and
 # traceable to train/validation only. Test labels never participate.
 
@@ -23,23 +23,29 @@ detector:
   max_missing_frac: 0.5
   drift_residual_z: 1.5
 
-causal:
-  tau_max_s: 5
-  alpha_level: 0.05
-  fdr_method: bh
-  min_edge_stability: 0.6
-  candidate_hop: 2
-  background_pre_s: 60
-  background_post_s: 60
-  stability_bootstraps: 30
-  rank_weights:
-    detector: 0.25
-    ancestor: 0.25
-    temporal: 0.20
-    stability: 0.15
-    effect: 0.10
-    confounding: 0.05
+torai:
+  resample_s: 15
+  gamma: 5
+  bins: 5
+  localized: true
+  scaler: standard        # robust shown to collapse SS log-modality severity (user decision 2026-08-29)
+  covariance_type: diag   # full = faithful
+  n_components_max: 10
+  discretize_strategy: quantile
+  random_state: 0
+  gmm_max_iter: 50
+  normal_post_trim: 15
+  variant: improved       # faithful|improved
 
+compute:
+  profile: quick              # smoke|quick|standard|full
+  workers: 1
+  max_cases: 20
+  cache: true
+  cache_dir: results/cache
+
+experiments:
+  seeds: [7, 11, 19]
 budget:
   max_window_ms: 50
   max_rss_mb: 200
@@ -70,6 +76,11 @@ datasets:
     manifest: data/manifests/rcaeval.json
     suites: [re1, re2, re3]
     metrics: [ac1, ac3, avg5]
+  torai:
+    source: https://doi.org/10.6084/m9.figshare.31925976
+    manifest: data/torai/build_manifest.json
+    suites: [torai-ob, torai-ss, torai-tt]
+    metrics: [ac1, ac3, ac5, avg5]
   aiops2020:
     source: https://github.com/NetManAIOps/AIOps-Challenge-2020-Data
     license: non-commercial-research-required

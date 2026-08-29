@@ -1,24 +1,26 @@
 """Test-label leakage tests.
 
-Verifies that detection thresholds and rank weights are calibrated ONLY from
-train/validation — mutating or relabeling the test segment must never change
-the fitted model, its thresholds, or the ranking score of an incident.
+Verifies that detection thresholds are calibrated ONLY from train/validation —
+mutating or relabeling the test segment must never change the fitted model —
+and that TORAI's normal-window statistics come only from the pre-inject
+segment (anomalous samples pushed into the train side must not change them).
 """
 
 from __future__ import annotations
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from alg_models.data.replay import TelemetryFrame, TelemetryPoint
 from alg_models.detection import StreamingRobustDetector, get_detector
+from alg_models.causal.torai import severity_scores
 
 
 def _make_series(n_normal: int, n_anom: int, interval_s: float = 60.0,
                  seed: int = 1, anom_value: float = 200.0) -> TelemetryFrame:
     """Deterministic series: normal segment + anomaly segment at the END (the
-    test split), plus a normal tail. Returns the full frame and (train, val,
-    test) split boundaries in samples."""
+    test split), plus a normal tail."""
     rng = np.random.default_rng(seed)
     normal = rng.normal(50, 5, n_normal)
     anom = rng.normal(anom_value, 5, n_anom)
@@ -75,22 +77,9 @@ class TestNoLeakage:
         tb, _ = _fit_thresholds(flat)
         assert ta == tb
 
-    def test_rank_weights_not_tuned_on_test(self):
-        """CausalGraphRCA rank weights come from config; the same incident and
-        edges yield the same rank scores regardless of test labels (no test
-        split participates in the ranking step)."""
-        from alg_models.causal.ranking import RootCauseRanker
-
-        edges = []
-        ranker_a = RootCauseRanker(weights={"detector": 0.5, "ancestor": 0.5})
-        ranker_b = RootCauseRanker(weights={"detector": 0.5, "ancestor": 0.5})
-        assert ranker_a.w == ranker_b.w  # weights are config-derived, not test-tuned
-
     def test_fit_uses_only_train_val(self):
         """fit() must not depend on any test frame; calling fit with a
         different test frame leaves the card identical."""
-        from alg_models.schemas import ModelCard
-
         a = _make_series(300, 40, anom_value=200.0)
         b = _make_series(300, 40, anom_value=900.0)
         tr_a, va_a, _ = _split_time(a)
@@ -100,3 +89,28 @@ class TestNoLeakage:
         det2 = StreamingRobustDetector(window_ns=60_000_000_000, stride_ns=30_000_000_000)
         card2 = det2.fit(tr_b, va_b, seed=7)
         assert card.thresholds == card2.thresholds
+
+
+class TestToraiNoLeakage:
+    def test_normal_stats_only_from_pre_inject(self):
+        """TORAI's severity z-scores use pre-inject mean/std only: the
+        normalized severity ratio of two columns matches a manual computation
+        against the pre-inject window, regardless of post-inject magnitude."""
+        rng = np.random.default_rng(3)
+        pre = rng.normal(50, 1, 60)
+        post = rng.normal(50, 1, 60)
+        df = pd.DataFrame(
+            {
+                "time": list(range(120)),
+                "x_cpu": np.concatenate([pre, post + 30.0]),
+                "y_cpu": np.concatenate([pre, post]),
+            }
+        )
+        normal = df[df["time"] < 60][["x_cpu", "y_cpu"]]
+        anomal = df[df["time"] >= 60][["x_cpu", "y_cpu"]]
+        ranks = severity_scores(normal, anomal, "standard")
+        d = dict(ranks)
+        mu, sd = pre.mean(), pre.std(ddof=0)
+        z_x = np.max(np.abs((post + 30.0 - mu) / sd))
+        z_y = np.max(np.abs((post - mu) / sd))
+        assert np.isclose(d["x_cpu"], z_x / (z_x + z_y), rtol=1e-3)

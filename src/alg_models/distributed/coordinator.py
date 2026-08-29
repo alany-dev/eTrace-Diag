@@ -32,10 +32,9 @@ class Coordinator:
     """Aggregates agent summaries; runs Model 2 on the joint context."""
 
     def __init__(self, cluster_id: str, *, config: dict | None = None,
-                 use_jpcmciplus: bool = True, max_clock_skew_ns: int = 60_000_000_000):
+                 max_clock_skew_ns: int = 60_000_000_000):
         self.cluster_id = cluster_id
         self.config = config or {}
-        self.use_jpcmciplus = use_jpcmciplus
         self.max_clock_skew_ns = max_clock_skew_ns
         self.messages: list[AgentMessage] = []
 
@@ -102,12 +101,7 @@ class Coordinator:
         return order
 
     def analyze(self, frame_map: dict[str, TelemetryFrame], *, top_k: int = 3,
-                seed: int = 7) -> CausalReport:
-        """Model 2 over the joint context. When J-PCMCIplus cannot run (no
-        tigramite / insufficient data per device), falls back to per-device
-        graphs and marks 'not jointly identified' — never fakes distributed
-        causality."""
-        from ..causal import CausalGraphRCA
+                seed: int = 7, traces: tuple = (), logs: tuple = ()) -> CausalReport:
 
         # joint frame = concat of all hosts' frames (clock-corrected)
         corrected_frames: list = []
@@ -123,42 +117,28 @@ class Coordinator:
         if not corrected_frames:
             raise RuntimeError("no host frames provided for joint analysis")
         joint = TelemetryFrame(
-            points=tuple(sorted((p for f in corrected_frames for p in f.points), key=lambda p: p.ts_ns))
+            points=tuple(sorted((p for p in corrected_frames for p in p.points), key=lambda p: p.ts_ns))
         )
         joint_incident = None
         if self.messages:
-            # representative incident from the earliest host
             first = min(self.messages, key=lambda m: self.corrected(m)[0])
             joint_incident = first.incident
         ts = sorted({p.ts_ns for p in joint.points})
         span = ts[-1] - ts[0]
         cut1 = ts[0] + int(span * 0.6)
         cut2 = ts[0] + int(span * 0.8)
+        from ..causal import ToraiRCA
         train = TelemetryFrame(points=tuple(p for p in joint.points if p.ts_ns <= cut1))
         val = TelemetryFrame(points=tuple(p for p in joint.points if cut1 < p.ts_ns <= cut2))
-        rca = CausalGraphRCA(self.config, seed=seed)
-        report = rca.analyze(joint, train, val, top_k=top_k, incident=joint_incident)
-        if self.use_jpcmciplus and _jpcmciplus_available():
-            # jpcmciplus would run here in the multi-environment backend; the
-            # lite coordinator runs the same PCMCI pipeline on the joint frame
-            pass
-        else:
-            # explicit fallback: not jointly identified
-            extra = [
-                f"J-PCMCIplus joint identification not run per device "
-                f"({len(self.messages)} hosts); per-device graphs only — "
-                "not jointly identified"
-            ]
+        rca = ToraiRCA(self.config, seed=seed)
+        report = rca.analyze(joint, train, val, top_k=top_k, incident=joint_incident,
+                             logs=tuple(logs), traces=tuple(traces))
+        skew = max((abs(m.clock_offset_ns) for m in self.messages), default=0)
+        if skew > self.max_clock_skew_ns:
             report = report.model_copy(update={
-                "limitations": report.limitations + extra,
+                "limitations": report.limitations + [
+                    f"cross-host clock skew {skew} ns exceeds threshold "
+                    f"{self.max_clock_skew_ns} ns; cross-host timestamps suspect"
+                ],
             })
         return report
-
-
-def _jpcmciplus_available() -> bool:
-    try:
-        import tigramite  # noqa: F401
-
-        return tigramite.__version__ is not None
-    except Exception:
-        return False

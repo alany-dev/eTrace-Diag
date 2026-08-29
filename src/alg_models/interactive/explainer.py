@@ -4,10 +4,10 @@
 is used only when explicitly configured (env var + a checkpoint). The LLM
 input is restricted to structured evidence from `CausalReport` — never raw
 unfiltered telemetry. Every generated sentence is validated per-sentence:
-each causal assertion must cite ≥1 edge/metric/time-window/statistic; missing
-citations, nonexistent references, direction inconsistencies, or claims that
-exceed identifiability are REJECTED and the sentence falls back to the
-template. Chain-of-thought is never used as evidence or persisted.
+each causal assertion must cite a ranked candidate, an evidence indicator, or
+a cluster member; missing citations, nonexistent references, or direction
+inconsistencies are REJECTED and the sentence falls back to the template.
+Chain-of-thought is never used as evidence or persisted.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ import os
 import re
 from typing import Callable
 
-from ..schemas import CausalEdge, CausalReport, RootCauseCandidate
+from ..schemas import CausalReport, RootCauseCandidate
 
 
 class EvidenceError(ValueError):
@@ -42,46 +42,47 @@ class EvidenceNarrator:
 
     # -- validation ---------------------------------------------------------
 
+    def _valid_references(self, report: CausalReport) -> set[str]:
+        """Everything an assertion may cite: candidates, evidence indicators,
+        and cluster members."""
+        refs: set[str] = set()
+        for c in report.candidates:
+            refs.add(c.entity_id)
+            refs.update(c.evidence_indicators)
+        for cl in report.clusters:
+            refs.update(cl.members)
+        return refs
+
     def _validate_sentences(self, text: str, report: CausalReport) -> str:
         """Per-sentence validation; invalid sentences fall back to template
         sentences. Sentence boundaries at '. ' (narrator output is prose)."""
-        edge_ids = {e.edge_id for e in report.edges}
-        metric_ids: set[str] = set()
-        for e in report.edges:
-            metric_ids.add(e.src_entity_id)
-            metric_ids.add(e.dst_entity_id)
+        refs = self._valid_references(report)
         valid: list[str] = []
         for sentence in re.split(r"(?<=\.)\s+", text.strip()):
             if not sentence:
                 continue
-            if self._sentence_valid(sentence, report, edge_ids, metric_ids):
+            if self._sentence_valid(sentence, report, refs):
                 valid.append(sentence)
             else:
                 valid.append(self._template(report))
         return " ".join(valid)
 
     def _sentence_valid(self, sentence: str, report: CausalReport,
-                        edge_ids: set[str], metric_ids: set[str]) -> bool:
-        has_evidence = any(
-            cid in sentence for cid in edge_ids | metric_ids
-        ) or "intervention" in sentence.lower()
-        if not has_evidence:
+                        refs: set[str]) -> bool:
+        # must cite at least one valid reference
+        if not any(ref in sentence for ref in refs):
             return False
-        # nonexistent reference check: citations that look like edge ids must exist
-        for token in re.findall(r"e:[A-Za-z0-9_.:~@-]+", sentence):
-            if token.rstrip(".,;") not in edge_ids:
-                return False
-        # direction consistency: direction words must match candidate directions
+        # cited identifiers must exist in the reference set
+        # (generic English words are never validated as citations)
         for c in report.candidates:
-            if c.entity_id in sentence:
-                if c.identifiability != "identified" and re.search(
-                    r"\b(effect|causes|caused|due to)\b", sentence
-                ):
-                    return False
-                if c.direction == "up" and re.search(r"\b(decreased|down)\b", sentence):
-                    return False
-                if c.direction == "down" and re.search(r"\b(increased|up)\b", sentence):
-                    return False
+            if c.entity_id in sentence and c.direction == "up" and re.search(
+                r"\b(decreased|down|below)\b", sentence
+            ):
+                return False
+            if c.entity_id in sentence and c.direction == "down" and re.search(
+                r"\b(increased|up|above)\b", sentence
+            ):
+                return False
         return True
 
     # -- template -----------------------------------------------------------
@@ -89,38 +90,18 @@ class EvidenceNarrator:
     @staticmethod
     def _default_template(report: CausalReport) -> str:
         parts: list[str] = []
-        parts.append(
-            f"Incident {report.incident_id} "
-            f"[{report.window.start_ts_ns / 1e9:g}s, {report.window.end_ts_ns / 1e9:g}s] "
-            f"status={report.window.status}."
+        ranking = "; ".join(
+            f"{c.rank}. {c.entity_id} (severity {c.score:.3f}) — evidence: "
+            f"{', '.join(c.evidence_indicators[:3])}"
+            for c in report.candidates
         )
-        if report.anomalous_metrics:
+        parts.append(f"Incident {report.incident_id} root-cause ranking: {ranking}")
+        if report.clusters:
+            top = max(report.clusters, key=lambda cl: cl.cluster_score, default=None)
+            top_desc = ", ".join(top.members) if top else "n/a"
             parts.append(
-                "Anomalous metrics: "
-                + ", ".join(
-                    f"{m} ({report.window.directions.get(m, 'mixed')}, "
-                    f"score {report.window.metric_scores.get(m, 0):.2f})"
-                    for m in report.anomalous_metrics
-                )
-                + "."
-            )
-        for e in report.edges:
-            if e.edge_mark == "directed" and e.lag_ns > 0:
-                parts.append(
-                    f"Edge {e.edge_id}: {e.src_entity_id} affects "
-                    f"{e.dst_entity_id} at lag {e.lag_ns / 1e9:g}s "
-                    f"(p={e.p_value if e.p_value is None else round(e.p_value, 4)}, "
-                    f"stability={e.stability:.2f}, evidence={e.evidence_level})."
-                )
-        for c in report.candidates:
-            eff = (
-                f"effect {c.effect_estimate:.3g}"
-                if c.effect_estimate is not None
-                else "effect not identified"
-            )
-            parts.append(
-                f"Candidate rank {c.rank}: {c.entity_id} "
-                f"(score {c.score:.3f}, {c.identifiability}, {eff})."
+                f"symptom clusters: {len(report.clusters)}; "
+                f"top cluster: {top_desc}"
             )
         return " ".join(parts)
 

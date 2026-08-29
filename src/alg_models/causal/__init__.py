@@ -1,5 +1,5 @@
-"""Causal package — Model 2."""
+"""Causal package — Model 2 (TORAI)."""
 
-from .graph_rca import CausalGraphRCA
+from .torai import ToraiRCA
 
-__all__ = ["CausalGraphRCA"]
+__all__ = ["ToraiRCA"]

@@ -1,6 +1,5 @@
-"""Active query selection: chooses the next human question from graph
-inconsistencies, low edge stability, wide effect CI, and model/human opinion
-conflicts.
+"""Active query selection: chooses the next human question from TORAI
+candidate scores and feedback conflicts.
 
 The human only needs to confirm: anomaly window, direction, candidate root
 cause, or reject the result. Contradictory feedback is preserved (see
@@ -13,25 +12,16 @@ from ..schemas import CausalReport, FeedbackEvent
 
 
 def _uncertainty_score(report: CausalReport) -> float:
-    """Composite uncertainty in [0, 1]: low stability + wide CIs + abstentions."""
-    score = 0.0
-    n = max(1, len(report.edges))
-    for e in report.edges:
-        if e.stability < 0.6:
-            score += 0.3
-        if e.evidence_level in ("weak", "insufficient"):
-            score += 0.2
-    score /= n
+    """Composite uncertainty [0, 1] based on the top-2 candidate score gap and
+    abstention reasons."""
     candidates = report.candidates
-    if candidates:
-        wide_ci = sum(
-            1
-            for c in candidates
-            if c.effect_interval is not None
-            and (c.effect_interval[1] - c.effect_interval[0]) > 2.0
-        )
-        abstained = sum(1 for c in candidates if c.identifiability != "identified")
-        score += 0.3 * (wide_ci / len(candidates)) + 0.2 * (abstained / len(candidates))
+    if len(candidates) >= 2:
+        gap = candidates[0].score - candidates[1].score
+        score = 1.0 - min(1.0, max(0.0, gap))
+    else:
+        score = 1.0
+    n_abstained = sum(1 for c in candidates if c.abstained_reason is not None)
+    score += 0.1 * n_abstained
     return min(1.0, score)
 
 
@@ -47,13 +37,13 @@ def _disagreement(feedbacks: list[FeedbackEvent], report: CausalReport) -> bool:
     return False
 
 
-def select_next_question(report: CausalReport, feedback_records: list, ctx: dict | None = None) -> dict | None:
+def select_next_question(report: CausalReport, feedback_records: list) -> dict | None:
     """Returns a question descriptor or None when nothing needs asking.
 
-    Priority: contradiction > abstained top candidates > unstable strong
-    edges > wide effect CI. All outputs reference concrete incident/entity ids.
+    Priority: feedback/top-1 contradiction > no candidates > top-1/top-2
+    score gap < 0.05. All outputs reference concrete incident/entity ids.
     """
-    feedbacks = [r.feedback for r in feedback_records]
+    feedbacks = [r.feedback for r in feedback_records] if feedback_records else []
     if _disagreement(feedbacks, report):
         return {
             "incident_id": report.incident_id,
@@ -65,45 +55,23 @@ def select_next_question(report: CausalReport, feedback_records: list, ctx: dict
             "target_id": report.candidates[0].entity_id,
             "options": ["true_positive", "false_positive", "wrong_root_cause"],
         }
-    abstained = [c for c in report.candidates if c.identifiability != "identified"]
-    if abstained:
-        c = abstained[0]
+    if not report.candidates:
         return {
             "incident_id": report.incident_id,
-            "kind": "abstained_candidate",
-            "question": (
-                f"Candidate {c.entity_id} could not be identified "
-                f"({c.abstained_reason or 'non-identifiable'}); "
-                "is it the root cause?"
-            ),
-            "target_id": c.entity_id,
+            "kind": "observe",
+            "question": "No candidates were ranked; continue observing?",
             "options": ["confirmed", "rejected"],
         }
-    unstable = [e for e in report.edges if e.stability < 0.6 and e.edge_mark == "directed"]
-    if unstable:
-        e = unstable[0]
+    if len(report.candidates) >= 2 and report.candidates[0].score - report.candidates[1].score < 0.05:
+        c = report.candidates[0]
         return {
             "incident_id": report.incident_id,
-            "kind": "unstable_edge",
+            "kind": "confirm_top1",
             "question": (
-                f"Edge {e.src_entity_id}->{e.dst_entity_id} has stability "
-                f"{e.stability:.2f}; confirm the propagation direction."
+                f"Top-1 ({c.entity_id}) and top-2 are within 0.05 score; "
+                f"confirm {c.entity_id} as root cause."
             ),
-            "target_id": e.dst_entity_id,
+            "target_id": c.entity_id,
             "options": ["confirmed", "wrong_root_cause"],
         }
-    if report.candidates:
-        c = report.candidates[0]
-        if c.effect_interval is not None and (c.effect_interval[1] - c.effect_interval[0]) > 2.0:
-            return {
-                "incident_id": report.incident_id,
-                "kind": "wide_effect_ci",
-                "question": (
-                    f"Effect CI for {c.entity_id} is wide "
-                    f"({c.effect_interval[0]:.2f}, {c.effect_interval[1]:.2f}); "
-                    "confirm the magnitude."
-                ),
-                "target_id": c.entity_id,
-                "options": ["confirmed", "rejected"],
-            }
     return None

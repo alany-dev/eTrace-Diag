@@ -1,9 +1,8 @@
 """Tests for the Pydantic schema contracts (schemas.py).
 
 Covers: legal/illegal entity_type, empty window, duplicate/out-of-order
-timestamps, missing and stale points, non-identifiable effects, feedback
-conflict. Tests check structured errors and unchanged model versions, not just
-importability.
+timestamps, missing and stale points, TORAI candidate/cluster/report shapes,
+feedback conflict. Tests check structured errors, not just importability.
 """
 
 from __future__ import annotations
@@ -12,11 +11,11 @@ import pytest
 from pydantic import ValidationError
 
 from alg_models.schemas import (
-    CausalEdge,
     CausalReport,
     FeedbackEvent,
     IncidentWindow,
     RootCauseCandidate,
+    SymptomCluster,
     TelemetryFrame,
     TelemetryPoint,
 )
@@ -114,41 +113,58 @@ class TestIncidentWindow:
         assert i.metric_scores == {}
 
 
-class TestCausalEdge:
-    def test_valid_ci_order(self):
-        CausalEdge(
-            edge_id="e1", src_entity_id="host::a", dst_entity_id="host::b",
-            lag_ns=10, statistic=0.5, p_value=0.01,
-            confidence_interval=(0.2, 0.8), stability=0.9,
-            evidence_level="strong",
-        )
-
-    def test_invalid_ci_order(self):
-        with pytest.raises(ValidationError, match="confidence_interval"):
-            CausalEdge(
-                edge_id="e1", src_entity_id="host::a", dst_entity_id="host::b",
-                lag_ns=10, statistic=0.5, p_value=0.01,
-                confidence_interval=(0.8, 0.2), stability=0.9,
-                evidence_level="strong",
-            )
-
-
-class TestRootCauseCandidate:
-    def test_rank_ge_1(self):
+class TestToraiSchemas:
+    def test_candidate_rank_ge_1(self):
         with pytest.raises(ValidationError, match="rank"):
-            RootCauseCandidate(entity_id="h::cpu", rank=0, score=0.5)
+            RootCauseCandidate(entity_id="adservice", rank=0, score=0.5)
 
-    def test_valid(self):
-        c = RootCauseCandidate(entity_id="h::cpu", rank=1, score=0.5)
-        assert c.identifiability == "not_tested"
+    def test_candidate_defaults(self):
+        c = RootCauseCandidate(entity_id="adservice", rank=1)
+        assert c.severity == {}
+        assert c.evidence_indicators == []
+        assert c.cluster_id == -1
+        assert c.abstained_reason is None
 
-    def test_abstained(self):
+    def test_candidate_valid(self):
         c = RootCauseCandidate(
-            entity_id="h::cpu", rank=1, score=0.0,
-            identifiability="not_identifiable",
-            abstained_reason="no path to outcome",
+            entity_id="adservice", rank=2, score=0.3,
+            severity={"metric": 0.8, "log": 0.1},
+            evidence_indicators=["adservice_cpu", "adservice_mem"],
+            cluster_id=0,
         )
-        assert c.abstained_reason is not None
+        assert c.direction == "mixed"
+        assert c.evidence_indicators[0] == "adservice_cpu"
+
+    def test_symptom_cluster(self):
+        cl = SymptomCluster(cluster_id=0, members=["adservice", "cartservice"], cluster_score=0.9)
+        assert cl.cluster_id == 0
+        assert len(cl.members) == 2
+        assert cl.cluster_score == 0.9
+
+    def test_report_no_edges_field(self):
+        r = CausalReport(
+            incident_id="i1",
+            window=IncidentWindow(
+                incident_id="i1", start_ts_ns=0, end_ts_ns=10,
+                detected_at_ns=5, status="anomaly", severity=0.5,
+            ),
+            candidates=[RootCauseCandidate(entity_id="adservice", rank=1)],
+            clusters=[SymptomCluster(cluster_id=0, members=["adservice"])],
+        )
+        assert r.candidates[0].entity_id == "adservice"
+        assert r.clusters[0].cluster_id == 0
+        assert r.limitations == []
+
+    def test_report_rejects_edges_kwarg(self):
+        with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+            CausalReport(
+                incident_id="i1",
+                window=IncidentWindow(
+                    incident_id="i1", start_ts_ns=0, end_ts_ns=10,
+                    detected_at_ns=5, status="anomaly", severity=0.5,
+                ),
+                edges=[],
+            )
 
 
 class TestFeedbackEvent:
@@ -167,19 +183,6 @@ class TestFeedbackEvent:
                 label="invalid_label", target_id="h::cpu",
                 created_at_ns=1,
             )
-
-
-class TestNonIdentifiableEffect:
-    """Non-identifiable effect: a candidate with only bidirected/unknown
-    edges or no path to outcome must be marked not_identifiable."""
-
-    def test_candidate_not_identifiable(self):
-        c = RootCauseCandidate(
-            entity_id="host::cpu", rank=1, score=0.0,
-            identifiability="not_identifiable",
-            effect_estimate=None, effect_interval=None,
-        )
-        assert c.identifiability == "not_identifiable"
 
 
 class TestFeedbackConflict:

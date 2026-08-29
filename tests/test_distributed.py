@@ -67,18 +67,22 @@ def test_coordinator_clock_correction_and_order():
     assert byt < 16 * 1024, "summary reporting exceeds 16 KB/s-node budget"
 
 
-def test_coordinator_joint_analysis_falls_back_gracefully():
+def test_coordinator_joint_analysis_runs_torai():
     frame = load_replay("tests/fixtures/causal_disk_chain.jsonl")
     train, val, _ = split_by_time(frame, 0.6, 0.2)
-    a = EdgeAgent("host-a", "c1", config={"detector": {"name": "streaming"}})
+    # host with a large clock offset (> threshold) so the clock-skew
+    # limitation is appended
+    a = EdgeAgent("host-a", "c1", clock_offset_ns=120_000_000_000,
+                  config={"detector": {"name": "streaming"}})
     a.fit(train, val, seed=7)
-    coord = Coordinator("c1", use_jpcmciplus=True)
+    coord = Coordinator("c1", max_clock_skew_ns=60_000_000_000)
     for m in a.process(frame)[:1]:
         coord.ingest(m)
     report = coord.analyze({"host-a": frame}, top_k=3, seed=7)
-    # explicit 'not jointly identified' limitation, no fabricated joint graph
-    assert any("not jointly identified" in l for l in report.limitations)
     assert report.incident_id
+    assert report.candidates
+    assert any("clock skew" in l for l in report.limitations)
+    assert not any("j-pcmciplus" in l.lower() for l in report.limitations)
 
 
 def test_agent_rejects_wrong_cluster():

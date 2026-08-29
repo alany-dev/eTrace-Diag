@@ -49,49 +49,40 @@ implementation; this project targets Python 3.11.
   encodes numerical metrics and discrete state separately (STAR-style), never
   missing state as 0 (emits `state_unobserved` limitation instead).
 
-## Model 2 — causal discovery and RCA
+## Model 2 — causal discovery and RCA (TORAI)
 
-| Method | Year | Role | Paper | Code | Commit/tag | In/Out | License | Status |
-|---|---|---|---|---|---|---|---|---|
-| PCMCI+ (Tigramite) | NeurIPS 2020 | Main causal-discovery backbone; default `ParCorr` CI test + Benjamini–Hochberg FDR | <https://arxiv.org/abs/2010.01740> | <https://github.com/jakobrunge/tigramite> + docs <https://jakobrunge.github.io/tigramite/> | t.b.d. | multivariate time series → lagged+contemporaneous directed graph edges with statistic/p-value/CI | (verify; tigramite is BSD-3-style, confirm) | pending |
-| LPCMCI | NeurIPS 2019 | latent-confounding controls | <https://arxiv.org/abs/1905.09808> | same repo | — | series → PAG with bidirected/unknown marks | same | pending |
-| J-PCMCIplus | 2023 | multi-device/multi-environment context | <https://arxiv.org/abs/2305.04852> | same repo | — | series per environment → joint graph | same | pending |
-| Neural Granger | NeurIPS 2019 | nonlinearity contrast only | <https://arxiv.org/abs/1802.05842> | <https://github.com/iancovert/Neural-GC> | t.b.d. | series → lagged dependency weights | MIT (verify) | pending |
-| DyNOTEARS | NeurIPS 2020 | contrast only | <https://arxiv.org/abs/2006.15998> | official | t.b.d. | series → DAG | (verify) | pending |
-| GDN | AAAI 2021 | attribution contrast; learned dependency/attention is NOT a causal edge | <https://arxiv.org/abs/2101.10071> | <https://github.com/d-ailin/GDN> | t.b.d. | multivariate → anomaly attribution | MIT plus data license note (verify) | pending |
-| CausalRCA | — | RCA contrast: gradient graph + PageRank | <https://arxiv.org/abs/2110.10178> | <https://github.com/AXinx/CausalRCA_code> | t.b.d. | metrics + topology → ranked root causes | (verify) | pending |
-| InterFusion | KDD 2021 | hierarchical anomaly contrast | <https://dl.acm.org/doi/10.1145/3447548.3467227> | <https://github.com/zhhlee/InterFusion> | t.b.d. | series → hierarchical score | (verify) | pending |
-| MicroRCA | OSDI 2019 | microservice RCA contrast | <https://www.usenix.org/conference/osdi19/presentation/gan> | <https://github.com/elastisys/MicroRCA> | t.b.d. | app metric graph → cause candidate | (verify) | pending |
-| BARO | FSE 2024 | RCA contrast: change-point + ranking | <https://dl.acm.org/doi/10.1145/3663529.3663808> | <https://github.com/phamquiluan/baro> | t.b.d. | series → cause ranking | (verify) | pending |
-| LLM-TSAD | NeurIPS 2025 | explainer design reference (statistical decomposition, index-aware prompting, LLM temporal localization weakness) | / | <https://github.com/junwoopark92/LLM-TSAD> | t.b.d. | series → natural language | (verify) | pending |
-| OpenRCA | ICLR 2025 | tool-augmented RCA-agent interaction protocol contrast | / | <https://github.com/microsoft/OpenRCA> | t.b.d. | metrics/logs → agent reasoning | MIT (verify) | pending |
+| TORAI (Ψ-PC + GMM + RCD) | FSE 2026 | Main causal RCA model (multi-source: metrics + logs + traces, no service-call-graph dependency) | arXiv:2604.13522 (RCAEval) | <https://github.com/phamquiluan/RCAEval> | `RCAEval/e2e/torai.py` + `rcd.py` + patched causal-learn localized-PC | metric/log/trace tables + inject time → service-ranked root causes + per-modality severity + symptom clusters | MIT (verified, LICENSE-CausalLearn/README) | ported (native numpy, py3.11) |
+| BARO | FSE 2024 | RCA contrast: median/IQR single-source baseline | <https://dl.acm.org/doi/10.1145/3663529.3663808> | <https://github.com/phamquiluan/baro> | `RCAEval/e2e/baro.py` | series → cause ranking | MIT (verify) | ported |
+| CausalRCA | — | RCA contrast: gradient graph + PageRank | <https://arxiv.org/abs/2110.10178> | <https://github.com/AXinx/CausalRCA_code> | t.b.d. | metrics + topology → ranked root causes | (verify) | reference only |
+| LLM-TSAD | NeurIPS 2025 | explainer design reference (statistical decomposition, index-aware prompting, LLM temporal localization weakness) | / | <https://github.com/junwoopark92/LLM-TSAD> | t.b.d. | series → natural language | (verify) | reference |
 
-### Model 2 design decisions
+### Model 2 design decisions (TORAI)
 
-- PCMCI+ edges, lags, p-values and confidence intervals are the causal-evidence
-  interface. They remain subject to standard time-series causal assumptions:
-  causal stationarity, Markov property, faithfulness, sufficient sampling rate.
-  On detected hidden confounding / downsampling aliasing / non-stationarity /
-  clock misalignment → LPCMCI / J-PCMCIplus / CD-NOD contrast or output
-  `abstain`; an observational score is never claimed as a verified do-effect.
-- Stability bootstrap: resample background windows, record edge direction/lag
-  frequency; edges below `min_edge_stability` never enter the strong-evidence
-  path.
-- Bayesian/graph-machine-learning attention is attribution contrast only —
-  never named "causal" directly.
-- `EffectEstimator`: `E[Y_desc | do(X=x_high)] − E[Y_desc | do(X=x_baseline)]`
-  via Tigramite causal effects or equivalent g-computation, with bootstrap CI.
-  No valid adjustment set / non-identifiable data / bidirected or unknown path →
-  `not_identifiable`, candidate down-weighted, no pseudo-precise causal claim.
-- Function-level localization requires time-aligned profile stack/sample with a
-  `function` node; without reliable stack/trace identity, function edges are
-  `weak` and reported as "suspect scope", never final root cause.
-- Ranking is a configurable linear combination (weights calibrated only on
-  train/validation/synthetic):
-  `rank = w_detector*detector_contrib + w_ancestor*ancestor_score +
-  w_temporal*temporal_order + w_stability*edge_stability +
-  w_effect*effect_size − w_confounding*confounding_penalty`.
-  Pearson/PCC ranking is kept as a separate lower-bound column.
+- The causal core is **TORAI** (`src/alg_models/causal/torai.py`): per-modality
+  anomaly severity (vectorized max-|z|), fine→coarse aggregation (addup for
+  metric/traces, highest for logs), GMM symptom clustering with BIC selection,
+  and RCD (Ψ-PC) within-cluster refinement to order cluster members. The
+  output is service-ranked with `_A` suffix (RCAEval evaluator convention).
+- **Ψ-PC** (`src/alg_models/causal/psi_pc.py`) is a native numpy port of RCD's
+  chi-square conditional-independence skeleton search over discretized data —
+  no causal-learn dependency, runs on Python 3.11. `chisq_ci` is bit-exact vs
+  causal-learn (120/120 CI-test cases).
+- Missing modalities (no logs/traces) are blind spots: their severity
+  contributions are zero and recorded in `limitations`; severity never assumes
+  absence == 0.
+- Normal-window statistics are fitted only on the pre-inject (`time < inject`)
+  segment; post-inject samples never leak into normal statistics.
+- Two variants are supported: `faithful` (standard scaler, full covariance,
+  kmeans discretization, unbounded BIC — reproduces the paper) and `improved`
+  (standard scaler, diag covariance, truncated BIC ≤10, quantile
+  discretization, native-resolution normal-tail trim — latency/accuracy
+  improvements). The plan's `robust` scaler was dropped by user decision
+  2026-08-29: on SS its IQR≈0 fallback inflates sparse log-count z-scores and
+  collapses the ranking (Avg@5 0.59 vs faithful 0.93; component isolation
+  proved the scaler alone responsible).
+- `EffectEstimator` / PCMCI+ / topology-graph priors are removed; the causal
+  claim is the TORAI ranking + per-modality severity + symptom clusters, never
+  a verified do-effect.
 
 ## Interaction / LLM
 
@@ -125,10 +116,6 @@ the items listed.
 
 | Component | Implementation | Backend | Verified result |
 |---|---|---|---|
-| PCMCI+ | tigramite 5.2.10.1 official (candidate-restricted via `link_assumptions`) | `tigramite-pcmciplus` | runs; stationary chain recovered at lags 3/2/2; non-stationary (level-shift) data triggers conservative fallback + limitation |
-| GDN | real torch GDN (sensor embedding → learned attention adjacency → GAT forecast; PageRank + deviation attribution) | torch CPU | top-1 = noisiest DOWNSTREAM symptom (latency), NOT root — attention is not causal, as designed |
-| Neural Granger | 1-hidden MLP lagged regression, l1 Granger scores | torch CPU | hit@1=1, dense graph (SHD 23) |
-| DyNOTEARS | NOTEARS + lagged coefficients | torch CPU | hit@1=1, SHD 16 |
 | Anomaly Transformer | official thuml model code (CUDA→CPU port, `output_attention=True`), this project's train loop + no-adjust metric | torch CPU | SMD 3-machine subset, 2 epochs: point F1 0.243 (no point-adjust), seg F1 0.746 |
 
 ### Model 1 detection comparison (SMD: machine-1-1..1-3)
@@ -145,46 +132,65 @@ Preprocessing differences recorded (not test-tuned): this project's detectors us
 sample); Anomaly Transformer uses `win_size=100` (1 h 40 min) with train-fit
 standardization. Literature scores are never restated as this project's results.
 
-### Model 2 RCA comparison (synthetic SCM; RCAEval real data → HF-blocked, documented substitution)
+### Model 2 RCA — TORAI reproduction (RCAEval torai-ob, derived-from-re2)
 
-| Method | hit@1 | hit@3 | MRR | edge SHD | lag err |
-|---|---|---|---|---|---|
-| correlation (lower bound) | 0 | 1 | 0.5 | 3 | — |
-| GDN (attention, not causal) | 0 | 1 | 0.5 | 3 | — |
-| Neural Granger | 1 | 1 | 1.0 | 23 | 1.67 |
-| DyNOTEARS | 1 | 1 | 1.0 | 16 | 1.5 |
-| PCMCI+ (real tigramite) | 1 | 1 | 1.0 | 122 | 0.0 |
-| CausalGraphRCA (this project) | 1 | 1 | 1.0 | **2** | 0.0 |
+`uv run python -m experiments.run_torai --dataset torai-ob --variant faithful --seeds 7,11,19`
 
-Graph scores and RCA scores reported in separate columns (see
-evaluation-protocol.md). `CausalGraphRCA` attains the cleanest graph (SHD 2) on
-the non-stationary fixture via the shift guard + candidate restriction +
-stability bootstrap; raw tigramite still finds top-1 (ancestor coverage) but
-over-connects at every lag under the level shift.
+Coarse Avg@5 per fault (3 seeds, 90 cases); paper reference = RCAEval README
+(torai-ob, original Figshare dataset). Runtime per case (wall clock):
+
+| Metric | faithful | improved | paper (README torai-ob) |
+|---|---|---|---|
+| CPU | 0.807 | 0.844 | 0.96 |
+| MEM | 0.918 | 0.956 | 0.93 |
+| DISK | 0.933 | 0.978 | 1.0 |
+| SOCKET | 0.807 | 0.830 | 0.93 |
+| DELAY | 0.845 | 0.911 | 0.8 |
+| LOSS | 0.826 | 0.889 | 0.84 |
+| **AVERAGE** | **0.896** | **0.901** | ~0.91 |
+| latency p50/p95 (s/case) | 0.96 / 2.06 | 0.27 / 0.55 | — |
+| peak RSS (MB) | 218 | 216 | — |
+
+Baselines (faithful, seed 7): rcd_only 0.893, baro 0.656, correlation 0.900.
+Derived-from-re2 threshold (AVERAGE ≥ 0.75, same-direction ordering) met:
+AVERAGE 0.896, DELAY/LOSS exceed the paper reference. The improved variant
+(standard scaler + diag GMM + BIC≤10 + quantile discretization + native
+resolution trim) keeps Avg@5 ≥ faithful on this dataset while cutting p95
+latency ~73% (2.06 → 0.55 s).
+
+
+Full three-dataset faithful vs improved (3 seeds, 90 cases each, coarse Avg@5):
+
+| Dataset | faithful avg5 | improved avg5 | faithful p95 (s) | improved p95 (s) |
+|---|---|---|---|---|
+| torai-ob | 0.896 | 0.901 | 2.06 | 0.55 |
+| torai-ss | 0.925 | 0.911 | 2.34 | 0.94 |
+| torai-tt | 0.785 | 0.803 | 13.90 | 2.39 |
+
+Recorded honestly (user policy 2026-08-29: improvements are exploratory, no
+forced acceptance): improved ≥ faithful on ob/tt, −0.014 on ss; p95 latency
+cut 60–83% on all three datasets. Paper reference per fault only exists for
+torai-ob (table above); ss/tt reference values not published in the README.
 
 ### Blocked
 
 - **OmniAnomaly** official code is TensorFlow 1.x (`tfsnippet`) and cannot run on
   Python 3.11; recorded as blocked — no paper-equivalent VAE adapter fabricated.
-- **RCAEval** real data (TO-RAI, 3.4 GB on Hugging Face) is not reachable from
-  this network (`huggingface.co` times out); the runner substitutes the
-  deterministic synthetic SCM and records the substitution in `results`.
 - **AIOps 2020** still requires a non-commercial research license; unchanged.
+- The authoritative TORAI Figshare dataset is blocked by AWS WAF for direct
+  download from this host; the equivalent layout is derived from the local
+  RCAEval RE2 parquet snapshot (`experiments/torai_data.py`, manifest records
+  `source: derived-from-re2`). Reproduction thresholds for derived data:
+  AVERAGE Avg@5 ≥ 0.75 with same-direction ordering.
 
 ## Real-data runs (user-provided archives, 2026-08-27)
 
-### RCAEval RE1 (真实 735-case 数据，服务级聚合)
+### RCAEval RE2 (TORAI-derived, 90-case per system)
 
-`uv run python -m experiments.rcaeval --data data/rca_eval --suite RE1 --limit 20`
+`uv run python -m experiments.run_torai --dataset torai-ob|torai-ss|torai-tt --variant faithful --seeds 7,11,19`
 
-| System | CausalGraphRCA AC@1 / AC@3 / Avg@5 | 相关基线 AC@1 / AC@3 / Avg@5 |
-|---|---|---|
-| RE1-OB (Online Boutique) | 0.55 / 0.65 / 0.644 | 0.75 / 1.0 / 0.875 |
-| RE1-SS (Sock Shop) | 0.35 / 0.65 / 0.562 | 1.0 / 1.0 / 1.0 |
-| RE1-TT (TrainTicket) | 0.0 / 0.4 / 0.199 | 0.0 / 0.0 / 0.0 |
-
-TrainTicket 两类方法皆 0%（root_cause_service 命名与指标列前缀不一致、故障非明显
-电平漂移），为真实困难信号，未做调优掩盖。
+See the TORAI reproduction table above (per-fault Avg@5, coarse + fine, with
+p50/p95 per-case latency recorded in `results/torai/*.json`).
 
 ### AIOps 2020 预赛（用户提供 archive，非商业科研许可）
 

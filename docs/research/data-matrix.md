@@ -50,8 +50,8 @@ update.
 - Thresholds, `tau_max`, FDR `alpha`, and rank weights are calibrated ONLY on
   train/validation or synthetic ground truth — test labels never participate.
 - License failures change only the matrix and skip the dataset; the core
-  `StreamingRobustDetector`, FITS, PCMCI+, effect estimation and template
-  narrator must run independently of any blocked dataset.
+  `StreamingRobustDetector`, FITS, TORAI and template narrator must run
+  independently of any blocked dataset.
 
 ## Manifest convention
 

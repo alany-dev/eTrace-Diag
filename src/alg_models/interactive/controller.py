@@ -52,7 +52,6 @@ class VersionedStore:
         self._incidents: dict[str, IncidentRecord] = {}
         self._feedback: list[FeedbackRecord] = []
         self._feedbacks_by_incident: dict[str, list[FeedbackRecord]] = {}
-        self._causal_context: dict[str, dict] = {}  # incident_id -> analysis context
 
     # -- incidents ----------------------------------------------------------
 
@@ -85,17 +84,10 @@ class VersionedStore:
         else:
             rec.reports.append(report)
 
-    def store_causal_context(self, incident_id: str, context: dict) -> None:
-        self._causal_context[incident_id] = context
-
-    def causal_context(self, incident_id: str) -> dict | None:
-        return self._causal_context.get(incident_id)
-
     def latest_report(self, incident_id: str) -> CausalReport | None:
         rec = self._incidents.get(incident_id)
         if rec is None or not rec.reports:
             return None
-        return rec.reports[-1]
 
     def reports_for_incident(self, incident_id: str) -> list[CausalReport]:
         rec = self._incidents.get(incident_id)
@@ -211,51 +203,8 @@ class IncidentController:
         report = self.store.latest_report(incident_id)
         if report is None:
             return None
-        ctx = self.store.causal_context(incident_id) or {}
-        return select_next_question(report, self.store.feedbacks(incident_id), ctx)
+        return select_next_question(report, self.store.feedbacks(incident_id))
 
-    # -- what-if ------------------------------------------------------------
-
-    def what_if(self, incident_id: str, candidate_id: str, baseline: float, high: float,
-                *, dry_run: bool = True) -> dict:
-        from ..causal.effects import EffectEstimator
-
-        ctx = self.store.causal_context(incident_id)
-        if ctx is None:
-            raise FeedbackError("no_causal_context", f"incident {incident_id} has no causal analysis")
-        data = ctx["data"]
-        edges = ctx["edges"]
-        outcome = ctx.get("outcome_entity")
-        interval = ctx.get("sample_interval_ns")
-        if outcome is None or candidate_id == outcome or candidate_id not in data.node_ids:
-            return {
-                "incident_id": incident_id,
-                "candidate_id": candidate_id,
-                "effect_estimate": None,
-                "ci": None,
-                "identifiability": "not_identifiable",
-                "dry_run": dry_run,
-                "reason": "candidate not connected to an identified outcome",
-            }
-        eff = EffectEstimator(
-            tau_max_samples=ctx.get("tau_max_samples", 5),
-            alpha_level=ctx.get("alpha_level", 0.05),
-            seed=ctx.get("seed", 7),
-        ).estimate(
-            data, edges, candidate_id, outcome,
-            sample_interval_ns=interval,
-            x_baseline=baseline, x_high=high,
-            contemp_edges=[e for e in edges if e.lag_ns == 0],
-        )
-        return {
-            "incident_id": incident_id,
-            "candidate_id": candidate_id,
-            "effect_estimate": eff.estimate,
-            "ci": (eff.ci_lo, eff.ci_hi) if eff.ci_lo is not None else None,
-            "identifiability": eff.identifiability,
-            "dry_run": dry_run,  # never executes kill / rate-limit / rollback
-            "reason": eff.abstained_reason,
-        }
 
 
 def store_to_json(store: VersionedStore) -> str:

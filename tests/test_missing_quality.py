@@ -1,85 +1,36 @@
-"""Missing/stale quality handling + feedback conflict + identifiability tests.
+"""Missing/stale quality handling + feedback conflict + TORAI quality tests.
 
 Verifies:
-- causal discovery and effect estimation EXCLUDE imputed/missing/stale/
-  out_of_order points and record the exclusion count;
 - feedback targeting a nonexistent metric raises a structured error and
   leaves the model version unchanged;
 - contradictory feedback is preserved with a conflict flag;
-- deleting the adjustment set (mediator) makes the effect not_identifiable.
+- TORAI: non-observed (imputed/missing/stale/out_of_order) points are excluded
+  from the severity statistics (only observed points feed to_torai_frames);
+- missing modalities (no logs/traces) yield zero severity;
+- normal-window statistics come only from before inject time.
 """
 
 from __future__ import annotations
 
 import numpy as np
+import pandas as pd
 import pytest
 
-from alg_models.cli import split_by_time, load_config
+from alg_models.cli import split_by_time
 from alg_models.data.replay import load_replay
 from alg_models.detection import FeedbackError, get_detector
-from alg_models.schemas import FeedbackEvent, TelemetryFrame, TelemetryPoint
+from alg_models.schemas import (
+    FeedbackEvent,
+    IncidentWindow,
+    LogEvent,
+    TelemetryFrame,
+    TelemetryPoint,
+)
+from alg_models.causal.torai import ToraiRCA, severity_scores, to_torai_frames
 
 
 def _load(filename: str) -> TelemetryFrame:
     return load_replay(f"tests/fixtures/{filename}")
-
-
-class TestMissingQualityExclusion:
-    def test_discovery_excludes_non_observed_points(self):
-        """Mark part of the causal fixture stale/missing in the analysis
-        window; the discovery must exclude them and report the count."""
-        frame = _load("causal_disk_chain.jsonl")
-        # graft quality tags: make every point in [430s, 431s) stale
-        stale = TelemetryFrame(
-            points=tuple(
-                p.model_copy(update={"quality": "stale"})
-                if 430_000_000_000 <= p.ts_ns < 431_000_000_000
-                else p
-                for p in frame.points
-            )
-        )
-        from alg_models.causal.discovery import build_multivar, PCMCIPlusDiscovery
-        from alg_models.causal.graph import TemporalGraphBuilder
-
-        interval = 1_000_000_000
-        entities = sorted({p.entity_id for p in stale.points})
-        mbe: dict = {}
-        for p in stale.points:
-            mbe.setdefault(p.entity_id, set()).add(p.metric_id)
-        mbe = {e: sorted(m) for e, m in mbe.items()}
-        data = build_multivar(
-            stale, entity_ids=entities, metric_ids_by_entity=mbe,
-            start_ns=330_000_000_000, end_ns=500_000_000_000,
-            sample_interval_ns=interval,
-        )
-        cg = TemporalGraphBuilder(candidate_hop=2).build(stale, topology=None)
-        dis = PCMCIPlusDiscovery(
-            tau_max=5, alpha_level=0.05, min_edge_stability=0.6,
-            stability_bootstraps=2, sample_interval_ns=interval, seed=7,
-        )
-        res = dis.discover(data, cg, stale, sample_interval_ns=interval)
-        # stale cells in [430s,431s) are 5 columns x 1 row -> excluded > 0
-        assert res.excluded_points >= 5
-        assert res.total_points > res.excluded_points
-        # no edge carries a NaN statistic from the excluded points
-        for e in res.edges:
-            assert e.statistic == e.statistic  # not NaN
-
-    def test_report_notes_exclusion(self):
-        from alg_models.causal.report import build_report
-        from alg_models.schemas import IncidentWindow
-
-        inc = IncidentWindow(
-            incident_id="i1", start_ts_ns=0, end_ts_ns=10,
-            detected_at_ns=5, status="anomaly", severity=0.5,
-        )
-        r = build_report(
-            incident=inc, anomalous_metrics=["cpu.utilization"], edges=[],
-            candidates=[], outcome_entity=None, backend="lite",
-            excluded_points=3, total_points=10, bootstrap_runs=1,
-            limitations=[], model_version="0.1.0",
-        )
-        assert any("excluded non-observed points" in l for l in r.limitations)
 
 
 class TestFeedbackStructuredErrors:
@@ -153,7 +104,7 @@ class TestFeedbackSuppressionAndConflict:
             model_version=det.model_version,
         )
         card = det.update(fb)
-        assert card.model_version != det.model_version or True  # version bumped
+        assert card.model_version  # a new calibration card is produced
         replayed = det.score(frame)
         assert all(i.incident_id != anomaly.incident_id for i in replayed)
 
@@ -182,68 +133,84 @@ class TestFeedbackSuppressionAndConflict:
         assert labels == ["false_positive", "true_positive"]  # both preserved
 
 
-class TestNonIdentifiableEffect:
-    def test_mediator_deleted_makes_effect_not_identifiable(self):
-        """Delete the mediator (process.io_wait) from the data; the candidate
-        then has no lagged directed path to the outcome -> not_identifiable."""
-        from alg_models.causal.effects import EffectEstimator
-        from alg_models.causal.discovery import build_multivar, PCMCIPlusDiscovery
-        from alg_models.causal.graph import TemporalGraphBuilder
-
-        frame = _load("causal_disk_chain.jsonl")
-        # drop the mediator variable entirely
-        reduced = TelemetryFrame(
-            points=tuple(p for p in frame.points if p.metric_id != "process.io_wait")
+class TestToraiQuality:
+    def _incident(self, start_ns: int = 300_000_000_000) -> IncidentWindow:
+        return IncidentWindow(
+            incident_id="i1", start_ts_ns=start_ns, end_ts_ns=600_000_000_000,
+            detected_at_ns=start_ns, status="anomaly", severity=0.8,
+            metric_scores={"adservice_cpu": 0.9},
         )
-        interval = 1_000_000_000
-        entities = sorted({p.entity_id for p in reduced.points})
-        mbe: dict = {}
-        for p in reduced.points:
-            mbe.setdefault(p.entity_id, set()).add(p.metric_id)
-        mbe = {e: sorted(m) for e, m in mbe.items()}
-        data = build_multivar(
-            reduced, entity_ids=entities, metric_ids_by_entity=mbe,
-            start_ns=330_000_000_000, end_ns=500_000_000_000,
-            sample_interval_ns=interval,
-        )
-        cg = TemporalGraphBuilder(candidate_hop=2).build(reduced, topology=None)
-        dis = PCMCIPlusDiscovery(
-            tau_max=5, alpha_level=0.05, min_edge_stability=0.6,
-            stability_bootstraps=2, sample_interval_ns=interval, seed=7,
-        )
-        res = dis.discover(data, cg, reduced, sample_interval_ns=interval)
-        eff = EffectEstimator(tau_max_samples=5, alpha_level=0.05, seed=7).estimate(
-            data, res.edges, "host::disk.io_wait", "service::service.request_latency",
-            sample_interval_ns=interval, x_baseline=5.0, x_high=12.0,
-            contemp_edges=[e for e in res.edges if e.lag_ns == 0],
-        )
-        assert eff.identifiability == "not_identifiable"
-        assert eff.estimate is None
 
-    def test_sync_only_candidate_not_identifiable(self):
-        """A variable connected to the outcome only contemporaneously has no
-        lagged directed path -> not_identifiable (no claimed do-effect)."""
-        from alg_models.causal.effects import EffectEstimator
+    def _frame(self) -> TelemetryFrame:
+        pts = []
+        rng = np.random.default_rng(0)
+        for t in range(0, 600, 10):
+            for svc in ("adservice", "cartservice"):
+                for metric in ("cpu", "mem"):
+                    pts.append(
+                        TelemetryPoint(
+                            ts_ns=t * 1_000_000_000, entity_id=svc,
+                            entity_type="service", metric_id=metric,
+                            value=50.0 + (metric == "cpu") * 10.0 + rng.normal(0, 0.5),
+                        )
+                    )
+        return TelemetryFrame(points=tuple(sorted(pts, key=lambda p: p.ts_ns)))
 
-        class _FakeData:
-            node_ids = ["a::x", "a::y"]
-            values = np.zeros((10, 2))
-            observed = np.ones((10, 2), dtype=bool)
-            ts_ns = np.arange(10)
-            sample_interval_ns = 1_000_000_000
-
-        from alg_models.schemas import CausalEdge
-
-        edges = [
-            CausalEdge(
-                edge_id="e1", src_entity_id="b::z", dst_entity_id="a::y",
-                lag_ns=1_000_000_000, statistic=0.5, p_value=0.01,
-                stability=0.9, evidence_level="strong",
+    def test_to_torai_frames_excludes_non_observed_points(self):
+        """Only quality == "observed" points feed the metric table."""
+        frame = self._frame()
+        # mark 40% of points non-observed
+        mixed = TelemetryFrame(
+            points=tuple(
+                p.model_copy(update={"quality": "stale"}) if p.ts_ns % 4 == 0 else p
+                for p in frame.points
             )
-        ]
-        eff = EffectEstimator(tau_max_samples=1).estimate(
-            _FakeData(), edges, "a::x", "a::y",
-            sample_interval_ns=1_000_000_000,
-            x_baseline=0.0, x_high=1.0, contemp_edges=[],
         )
-        assert eff.identifiability == "not_identifiable"
+        tables = to_torai_frames(mixed, (), ())
+        metric = tables["metric"]
+        # observed-only points
+        n_obs_ts = sum(1 for t in range(0, 600, 10) if (t * 1_000_000_000) % 4 != 0)
+        assert len(metric) == n_obs_ts
+        assert len(metric) < len(range(0, 600, 10))
+
+    def test_missing_modality_zero_severity(self):
+        """No logs/traces -> their severity contributions are zero (blind spot),
+        metric-only ranking still produced."""
+        frame = self._frame()
+        rca = ToraiRCA({"torai": {"variant": "faithful"}}, seed=7)
+        tables = to_torai_frames(frame, (), ())
+        result = rca.analyze_tables(
+            tables["metric"], tables["logts"], None, None,
+            inject_ns=300_000_000_000, variant="faithful",
+        )
+        for svc, sev in result["severity_matrix"].items():
+            assert sev["log"] == 0.0
+            assert sev["trace_lat"] == 0.0
+            assert sev["trace_err"] == 0.0
+        assert len(result["service_ranks"]) > 0
+        assert any("traces absent" in l for l in result["limitations"])
+
+    def test_normal_stats_only_pre_inject(self):
+        """Severity z-scores are computed against pre-inject mean/std only:
+        the normalized severity ratio of two columns must match the ratio of
+        their manual max-|z| computed from the pre-inject window."""
+        rng = np.random.default_rng(3)
+        pre = rng.normal(50, 1, 60)
+        post = rng.normal(50, 1, 60)
+        df = pd.DataFrame(
+            {
+                "time": list(range(120)),
+                "x_cpu": np.concatenate([pre, post + 30.0]),
+                "y_cpu": np.concatenate([pre, post]),
+            }
+        )
+        normal = df[df["time"] < 60][["x_cpu", "y_cpu"]]
+        anomal = df[df["time"] >= 60][["x_cpu", "y_cpu"]]
+        ranks = severity_scores(normal, anomal, "standard")
+        d = dict(ranks)
+        mu, sd = pre.mean(), pre.std(ddof=0)
+        z_x = np.max(np.abs((post + 30.0 - mu) / sd))
+        z_y = np.max(np.abs((post - mu) / sd))
+        ratio_expected = z_x / (z_x + z_y)
+        assert np.isclose(d["x_cpu"], ratio_expected, rtol=1e-3)
+        assert np.isclose(sum(d.values()), 1.0, rtol=1e-6)

@@ -96,13 +96,13 @@ def cmd_detect(args: argparse.Namespace) -> int:
 
 
 def cmd_causal(args: argparse.Namespace) -> int:
-    from .causal.graph_rca import CausalGraphRCA  # lazy: causal deps optional
+    from .causal import ToraiRCA  # lazy: causal deps optional
 
     cfg = load_config(args.config)
     frame = load_replay(args.input)
     split = cfg.get("split", {"train_frac": 0.6, "val_frac": 0.2})
     train, val, _test = split_by_time(frame, split["train_frac"], split["val_frac"])
-    rca = CausalGraphRCA(cfg, seed=args.seed)
+    rca = ToraiRCA(cfg, seed=args.seed)
     report = rca.analyze(frame, train, val, top_k=args.top_k)
     if args.output:
         out = Path(args.output)
@@ -112,7 +112,7 @@ def cmd_causal(args: argparse.Namespace) -> int:
         print(json.dumps(report.model_dump(), indent=2))
     print(
         f"[causal] incident={report.incident_id} candidates={len(report.candidates)} "
-        f"edges={len(report.edges)} top1={report.candidates[0].entity_id if report.candidates else None}",
+        f"top1={report.candidates[0].entity_id if report.candidates else None}",
         file=sys.stderr,
     )
     return 0

@@ -56,62 +56,71 @@ path. The protocol explicitly notes each difference in preprocessing, threshold
 tuning, and split strategy with the paper's reported numbers; it never restates
 test-tuned literature scores.
 
-## Model 2 — causal discovery & RCA
+## Model 2 — TORAI multi-source RCA
 
 ### Primary metrics
 
-- **Graph-level**: edge SHD, precision, recall, lag recovery error, edge
-  stability (bootstrap frequency across background windows)
-- **RCA-level**: root-cause hit@1, hit@3, Mean Reciprocal Rank (MRR), effect
-  CI coverage, abstention precision, abstention coverage
-- Graph scores and RCA scores are reported in separate columns.
+- **Coarse-grained (service-level)**: AC@1, AC@3, AC@5, Avg@5. The service is
+  the prefix before the first `_` in the ranked indicator name, deduplicated
+  per list (RCAEval Evaluator semantics). The output rank uses `_A` suffix
+  convention: `` split("_")[0] `` extracts the service.
+- **Fine-grained (service + fault type)**: AC@1, AC@3, AC@5, Avg@5. The
+  indicator is `{service}_{fault_type}`; `"A"` sentinel metric is treated as
+  unknown.
+- **Per-case latency**: p50 and p95 wall-clock seconds for `analyze_tables`.
+- **Peak RSS**: memory usage during analysis.
 
 ### Methods compared
 
-- Correlation ranking (baseline lower bound)
-- GDN (attention-based attribution — explicitly NOT causal)
-- PCMCI+ (real PCMCI+ from tigramite when available; built-in ParCorr PCMCI
-  lite as fallback)
-- LPCMCI / Neural Granger (contrast, only when dependencies/conditions met)
-- `CausalGraphRCA` (this project: staged graph builder → PCMCI+ discovery →
-  stability bootstrap → effect estimation → rank combination)
+- **torai** — full TORAI pipeline: per-modality severity → GMM clustering →
+  RCD (Ψ-PC) within-cluster refinement.
+- **rcd_only** — Ψ-PC directly on the full metric+log matrix (no clustering=
+  CausalRanker ablation).
+- **baro** — median/IQR single-source baseline (RCAEval e2e/baro.py).
+- **correlation** — Pearson correlation with the anomaly indicator (lower
+  bound).
 
 ### Experimental protocol
 
 ```bash
-uv run python -m experiments.run_rca \
-    --config configs/benchmark.yaml \
-    --dataset rcaeval \
-    --suite re1 \
-    --methods correlation,gdn,pcmci_plus,causal_graph_rca \
-    --seed 7 \
-    --output results/rcaeval-re1
+uv run python -m experiments.run_torai \
+    --dataset torai-ob|torai-ss|torai-tt \
+    --variant faithful|improved \
+    --seeds 7,11,19 \
+    --methods torai,rcd_only,baro,correlation
 ```
 
-1. Candidates are restricted to the same host, `contains`/`calls`/
-   `communicates`/`shares_resource` edges and a finite hop limit. The number
-   of pruned candidate edges is reported for audit.
-2. Background data is the window around the anomaly ± 2× max lag. The same
-   split/background window is used for every method.
-3. `tau_max`, `alpha_level`, FDR method, `min_edge_stability`, and rank weights
-   are calibrated only on train/validation or synthetic SCM ground truth.
-4. On RCAEval, RE1/RE2/RE3 use their ground truth and AC@1/AC@3/Avg@5.
-5. AIOps 2020: only after written license obtained; otherwise skip.
-6. Controlled injection (DeathStarBench + Chaos Mesh): per service × fault
-   type, ≥3 runs, record injection start/end, target, config, clock offset,
-   recovery action. The protocol reports the mean and std of all metrics.
+1. Data loading: TORAI-format directories under `data/torai/torai-{OB,SS,TT}`.
+   The window is ± 10 minutes around `inject_time` (20 minutes total, matching
+   RCAEval `--length 20`). The normal side is the tail half of the pre-inject
+   segment; the anomalous side is the head half of the post-inject segment.
+2. Ground truth is parsed from the directory path: `{service}_{fault}/{run}`.
+   The service name is the first component before `_`; the fault type is the
+   remaining suffix.
+3. Variant `faithful` uses standard scaler, full covariance GMM, kmeans
+   discretization, unbounded BIC. Variant `improved` uses standard scaler,
+   diag covariance, truncated BIC ≤10, quantile discretization, and a
+   native-resolution normal-tail trim of `resample_s` rows (~15 s). The
+   plan's `robust` scaler was dropped by user decision 2026-08-29 after
+   component isolation showed it alone collapses SS rankings.
+4. Avg@5 is the primary aggregate metric. Per-fault breakdowns are reported
+   for CPU, MEM, DISK, SOCKET, DELAY, LOSS with the same naming convention
+   as the RCAEval paper.
+5. Latency budgets: p50 < 10 s per case, p95 < 30 s per case on the reference
+   CPU (Xeon Gold 6326, 64 cores, no GPU).
 
-### Identifiability and abstention
+### Missing modalities and abstention
 
-- When no valid adjustment set exists, data is non-identifiable, or the path
-  graph contains only bidirected/unknown edges, `EffectEstimator` returns
-  `not_identifiable` and the candidate is down-weighted (not excluded entirely
-  but marked as "insufficient evidence").
-- When hidden confounding is detected by LPCMCI/FCI, a `bidirected`/`unknown`
-  edge mark triggers `evidence_level = "insufficient"`.
-- When J-PCMCIplus fails (dependency/data condition not met), the report
-  falls back to per-device graphs and explicitly states "not jointly identified"
-  — no claimed distributed causal graph.
+- Missing logs or traces are blind spots: their severity contribution is 0
+  and recorded in the report's `limitations`.
+- Single-service clusters skip RCD refinement (GMM has only one service per
+  cluster) and fall back to severity ordering.
+- The normal-window statistics use only the `time < inject_ns` segment; the
+  `normal_post_trim` parameter (improved variant) additionally drops the last
+  `resample_s` NATIVE-resolution rows (~15 s) of the normal window, before
+  the 15 s resample, to remove anomaly-detection-delay contamination.
+- The `_A` suffix output convention is inherited from the RCAEval evaluator's
+  string-parsing API; it is NOT a semantic claim about the ranking.
 
 ## API validation
 
@@ -123,8 +132,6 @@ curl -sS -X POST http://127.0.0.1:8090/v1/causal/analyze -H 'content-type: appli
     --data @tests/fixtures/causal_request.json
 curl -sS -X POST http://127.0.0.1:8090/v1/feedback -H 'content-type: application/json' \
     --data @tests/fixtures/false_positive_feedback.json
-curl -sS -X POST http://127.0.0.1:8090/v1/what-if -H 'content-type: application/json' \
-    --data @tests/fixtures/what_if_request.json
 ```
 
 - All responses must use the Pydantic contract models.
