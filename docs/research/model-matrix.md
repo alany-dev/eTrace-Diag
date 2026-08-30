@@ -148,6 +148,28 @@ pending until the Figshare archive is obtainable.
 (requires `data/torai/torai-OB/...` from the official Figshare zip, see
 `experiments/download_torai_data.py` for the acquisition procedure).
 
+### TORAI on official RCAeval RE1/RE2/RE3 (direct parquet, cases.parquet GT)
+
+`uv run python -m experiments.run_torai_rcaeval --suite RE1|RE2|RE3 --variant faithful|improved [--logs --traces]`
+
+No derived dataset: each case's `metrics.parquet`/`logs.parquet`/`traces.parquet`
+is read directly; ground truth = `cases.parquet` (root_cause_service +
+inject_time); window ±10 min (main.py `--length 20`). Coarse service-level
+AC@k / Avg@5, RCAEval Evaluator semantics (`split("_")[0]`, `-db` stripped).
+
+| Suite | cases | modalities | faithful Avg@5 (s) | improved Avg@5 (s) |
+|---|---|---|---|---|
+| RE1 | 375 | metric | 0.866 (373/375, 937 s) | 0.867 (373/375, 208 s) |
+| RE2 | 270 | metric+log+trace | 0.814 (270/270, 4632 s) | 0.820 (270/270, 4232 s) |
+| RE3 | 90 | metric+log+trace | 0.870 (90/90, 828 s) | 0.874 (90/90, 492 s) |
+
+Notes: 2 RE1 cases have all-constant metrics in the normal window → excluded
+("empty severity matrix (no signal)"). improved keeps Avg@5 ≥ faithful on all
+suites; RE1 speedup 4.5× (faithful 937 s → improved 208 s). Ψ-PC kmeans
+discretization falls back to quantile when samples < bins (short windows the
+reference would crash on); empty severity matrices return an empty ranking
+instead of raising.
+
 ### Blocked
 
 - **OmniAnomaly** official code is TensorFlow 1.x (`tfsnippet`) and cannot run on

@@ -198,6 +198,11 @@ def discretize(data: pd.DataFrame, bins: int, strategy: str = "kmeans") -> pd.Da
         f_vals = data[F_NODE]
     disc = data[non_f]
     if disc.shape[1] > 0:
+        # kmeans discretization needs n_samples >= n_clusters(=bins); very
+        # short windows (e.g. RE1 delay cases, ~4 samples after resample)
+        # crash the reference too — fall back to quantile so the case runs.
+        if strategy == "kmeans" and disc.shape[0] < bins:
+            strategy = "quantile"
         enc = KBinsDiscretizer(
             n_bins=bins, encode="ordinal", strategy=strategy, subsample=None
         )

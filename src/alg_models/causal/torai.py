@@ -496,6 +496,19 @@ class ToraiRCA:
         service_list = m.index.to_list()
         X = m.to_numpy()
 
+        if X.shape[0] == 0:
+            # no service carried any severity (e.g. all metric columns constant
+            # in the normal window); return an empty ranking instead of
+            # crashing the GMM BIC scan (reference torai() would also fail).
+            return {
+                "service_ranks": [],
+                "cluster_labels": [],
+                "cluster_scores": [],
+                "severity_matrix": {},
+                "indicator_ranks": {},
+                "limitations": ["no evaluable service (all metrics constant)"],
+            }
+
         # ---- clustering ----
         labels, cluster_rank = symptom_cluster(X, service_list, cfg)
 
