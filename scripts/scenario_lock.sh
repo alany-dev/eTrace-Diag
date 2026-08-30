@@ -17,23 +17,18 @@ wait "$STRESS"
 sleep 5
 stop_harness
 
-S=$(latest_session)
-require_nonempty "$S/deep/1/lock_contention.txt" "lock_contention.txt"
+S=$(latest_session); DB="$S/etrace.sqlite3"
+require_nonempty "$DB" "etrace.sqlite3"
+require_db_rows "$DB" "SELECT COUNT(*) FROM deep_lock WHERE ordinal=1" "deep_lock"
 
 # lock_st.waits must grow during the run.
-python3 - "$S/deep/1/pre_series.jsonl" "$S/deep/1/post_series.jsonl" <<'PY' || exit 1
-import json, sys
-seen = False
-for path in sys.argv[1:]:
-    for line in open(path):
-        e = json.loads(line)
-        if e.get("lock_waits", 0) > 0:
-            seen = True
-print("OK: lock waits observed in snapshots" if seen else "no lock waits seen")
-sys.exit(0 if seen else 1)
+python3 - "$DB" <<'PY' || exit 1
+import sqlite3, sys
+n = sqlite3.connect(sys.argv[1]).execute(
+    "SELECT COUNT(*) FROM deep_series WHERE ordinal=1 AND lock_waits > 0").fetchone()[0]
+print("OK: lock waits observed in snapshots" if n else "no lock waits seen")
+sys.exit(0 if n else 1)
 PY
 
 # At least one hot lock address listed.
-grep -q "0x" "$S/deep/1/lock_contention.txt" \
-  && echo "OK: lock_contention.txt lists >=1 hot lock_addr" \
-  || { echo "FAIL: no hot lock address listed" >&2; exit 1; }
+require_db_rows "$DB" "SELECT COUNT(*) FROM deep_lock WHERE ordinal=1 AND addr LIKE '0x%'" "hot lock addr"

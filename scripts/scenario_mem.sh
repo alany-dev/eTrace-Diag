@@ -17,24 +17,27 @@ wait "$STRESS"
 sleep 5
 stop_harness
 
-S=$(latest_session)
-require_nonempty "$S/memory_events.txt" "memory_events.txt"
-require_nonempty "$S/deep/1/pre_series.jsonl" "pre_series.jsonl"
+S=$(latest_session); DB="$S/etrace.sqlite3"
+require_nonempty "$DB" "etrace.sqlite3"
+require_db_rows "$DB" "SELECT COUNT(*) FROM memory_events" "memory_events"
+require_db_rows "$DB" "SELECT COUNT(*) FROM deep_series WHERE ordinal=1 AND phase=0" "pre_series"
 
 # faults.major should be non-zero in at least one pre/post snapshot.
-python3 - "$S/deep/1/pre_series.jsonl" "$S/deep/1/post_series.jsonl" <<'PY' || exit 1
-import json, sys
-seen = False
-for path in sys.argv[1:]:
-    for line in open(path):
-        e = json.loads(line)
-        if e.get("pf_major", 0) > 0:
-            seen = True
-print("OK: major faults observed in snapshots" if seen else "no major faults seen")
-sys.exit(0 if seen else 1)
+python3 - "$DB" <<'PY' || exit 1
+import sqlite3, sys
+n = sqlite3.connect(sys.argv[1]).execute(
+    "SELECT COUNT(*) FROM deep_series WHERE ordinal=1 AND pf_major > 0").fetchone()[0]
+print("OK: major faults observed in snapshots" if n else "no major faults seen")
+sys.exit(0 if n else 1)
 PY
 
 # kswapd/direct-reclaim transitions were logged.
-grep -q "direct_reclaim" "$S/memory_events.txt" \
-  && echo "OK: memory_events.txt recorded reclaim/kswapd transitions" \
+python3 - "$DB" <<'PY' \
+  && echo "OK: memory_events recorded reclaim/kswapd transitions" \
   || echo "WARN: no reclaim transitions this run (workload may not have paged)"
+import sqlite3, sys
+n = sqlite3.connect(sys.argv[1]).execute(
+    "SELECT COUNT(*) FROM memory_events "
+    "WHERE kswapd_active > 0 OR direct_reclaim > 0 OR nr_reclaimed > 0").fetchone()[0]
+sys.exit(0 if n else 1)
+PY

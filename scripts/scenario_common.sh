@@ -27,13 +27,13 @@ latest_session() {
   ls -td "$OUT"/*/ 2>/dev/null | head -1
 }
 
-# Assert $1 exists and is non-empty; $2 is a description.
-require_nonempty() {
-  local f="$1" desc="$2"
-  if [ -s "$f" ]; then
-    echo "OK: $desc ($f)"
-  else
-    echo "FAIL: $desc ($f) missing/empty" >&2
-    exit 1
-  fi
+# $1=db 路径 $2=SQL $3=描述：查询首值>0 则 OK
+require_db_rows() {
+  local db="$1" sql="$2" desc="$3"
+  if python3 - "$db" "$sql" <<'EOF'
+import sqlite3, sys
+n = sqlite3.connect(sys.argv[1]).execute(sys.argv[2]).fetchone()[0]
+sys.exit(0 if n and n > 0 else 1)
+EOF
+  then echo "OK: $desc"; else echo "FAIL: $desc" >&2; exit 1; fi
 }
