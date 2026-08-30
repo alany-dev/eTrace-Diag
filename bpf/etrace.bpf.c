@@ -108,7 +108,7 @@ struct lock_wait_t { u64 lock_addr; u64 ts; u32 flags; };
 struct sys_lat_key { u32 tid; u32 id; };
 struct sys_lat_val { u64 count; u64 lat_sum; u32 hist[HIST64_BINS]; };
 struct syscall_caller_key { u32 id; u32 user_sid; };
-struct oncpu_key { u32 pid; u32 user_sid; u32 kernel_sid; };
+struct oncpu_key { u32 pid; u32 tid; u32 user_sid; u32 kernel_sid; };
 struct offcpu_key { u32 tid; u32 ksid; };
 struct io_file_key { u32 dev; u64 ino; char path[256]; };
 struct io_file_val { u64 bytes; u32 ops; };
@@ -725,7 +725,7 @@ int oncpu(struct bpf_perf_event_data *ctx) {
   int kernel_sid = bpf_get_stackid(ctx, &stackmap, BPF_F_FAST_STACK_CMP);
   if (user_sid < 0) user_sid = 0;
   if (kernel_sid < 0) kernel_sid = 0;
-  struct oncpu_key k = {.pid = pid, .user_sid = (u32)user_sid, .kernel_sid = (u32)kernel_sid};
+  struct oncpu_key k = {.pid = pid, .tid = tid, .user_sid = (u32)user_sid, .kernel_sid = (u32)kernel_sid};
   u64 *c = h_u64(&oncpu_count, &k);
   if (c) (*c)++;
   return 0;

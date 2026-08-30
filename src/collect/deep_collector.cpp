@@ -10,6 +10,7 @@
 #include <cstring>
 #include <map>
 #include <sstream>
+#include <unordered_map>
 #include <utility>
 
 #include "logging.h"
@@ -19,7 +20,7 @@ namespace etrace_diag {
 namespace {
 
 // Mirrors of DEEP result map keys/values (frozen layout; matches etrace.bpf.c).
-struct OncpuKey { u32 pid; u32 user_sid; u32 kernel_sid; };
+struct OncpuKey { u32 pid; u32 tid; u32 user_sid; u32 kernel_sid; };
 struct OffcpuKey { u32 tid; u32 ksid; };
 struct SysLatKey { u32 tid; u32 id; };
 struct SysLatVal { u64 count; u64 lat_sum; u32 hist[64]; };
@@ -28,6 +29,19 @@ struct IoFileVal { u64 bytes; u32 ops; };
 struct LockHotVal { u64 count; u64 lat_sum; };
 struct LatStatVal13 { u64 count; u64 lat_sum; u32 hist[13]; };
 
+// Value mirror of the task_meta map (tid -> {tgid, comm[16]}); layout matches
+// task_meta_t used by EbpfManager::UpdateTarget in ebpf_manager.cpp.
+struct TaskMetaVal { u32 tgid; u8 comm[16]; };
+
+// comm 消毒：';' '/' ' ' '\t' -> '_'（与 StackSymbolizer::Resolve 的消毒规则一致）。
+static std::string SanitizeComm(const u8* comm) {
+  std::string s;
+  for (int i = 0; i < 16 && comm[i]; ++i) {
+    char c = (char)comm[i];
+    s += (c == ';' || c == '/' || c == ' ' || c == '\t') ? '_' : c;
+  }
+  return s;
+}
 // Sum one record's counters/histograms into another (per-CPU merge support).
 void AddSnap(KernelSnapshotRec& dst, const KernelSnapshotRec& src) {
   dst.on_cpu_ns += src.on_cpu_ns;
@@ -247,11 +261,13 @@ void DeepCollector::ExtractPre(uint64_t anomaly_start_ns, const Config& cfg) {
     std::sort(recs.begin(), recs.end(),
               [](const auto& a, const auto& b) { return a.ts_ns < b.ts_ns; });
 
+  writer_.BeginBatch();
   for (const auto& r : recs) {
     CanonicalSnapshot s;
     DecodeSnapshot(r, s);
     writer_.WritePreSeries(s);
   }
+  writer_.CommitBatch();
   LogInfo("deep pre-window extracted: %zu records (head=%llu)", recs.size(),
           (unsigned long long)head);
 }
@@ -266,6 +282,7 @@ void DeepCollector::DrainPost() {
   u64 cap = bpf_map__max_entries(ebpf_.Map("recorder"));
   u64 begin = prev_head_ + 1;
 
+  writer_.BeginBatch();
   if (head - prev_head_ >= cap - 64) {
     writer_.WritePostSeriesGap(prev_head_, head);
     LogWarn("flight recorder overrun: gap [%llu, %llu)", (unsigned long long)prev_head_,
@@ -295,11 +312,27 @@ void DeepCollector::DrainPost() {
     DecodeSnapshot(r, s);
     writer_.WritePostSeries(s);
   }
+  writer_.CommitBatch();
 }
 
 void DeepCollector::DumpDeepMaps(const Config& /*cfg*/) {
-  std::ostringstream syscall, lock, runq, iof;
-  std::string folded_on_cpu, folded_off_cpu;
+  writer_.BeginBatch();
+
+  // Attribution tables from task_meta: tid -> tgid, tid -> comm, tgid -> comm
+  // (tgid_comm takes any member thread's comm, first-seen wins).
+  std::unordered_map<u32, u32> tid_tgid;          // tid -> tgid
+  std::unordered_map<u32, std::string> tid_comm;  // tid -> comm
+  std::unordered_map<u32, std::string> tgid_comm; // tgid -> comm
+  if (auto* tm = ebpf_.Slice("task_meta")) {
+    tm->ForEach([&](const void* key, const void* val) {
+      u32 tid = *(const u32*)key;
+      auto* v = (const TaskMetaVal*)val;
+      std::string c = SanitizeComm(v->comm);
+      tid_tgid[tid] = v->tgid;
+      tid_comm[tid] = c;
+      tgid_comm.emplace(v->tgid, c);
+    });
+  }
 
   auto* syslat = ebpf_.Slice("sys_lat");
   syslat->ForEach([&](const void* key, const void* value) {
@@ -307,11 +340,10 @@ void DeepCollector::DumpDeepMaps(const Config& /*cfg*/) {
     auto* v = (const SysLatVal*)value;
     float p50 = PercentileUs(v->hist, 64, 1, 2, 0.50);
     float p99 = PercentileUs(v->hist, 64, 1, 2, 0.99);
-    syscall << "tid=" << k->tid << " syscall=" << k->id << " count=" << v->count
-            << " avg_us=" << (v->count ? (double)v->lat_sum / v->count / 1000.0 : 0)
-            << " p50_us=" << p50 << " p99_us=" << p99 << "\n";
+    writer_.WriteDeepSyscall(k->tid, k->id, v->count,
+                             v->count ? (float)((double)v->lat_sum / v->count / 1000.0) : 0.0f,
+                             p50, p99);
   });
-  writer_.WriteText("syscall_hotspot.txt", syscall.str());
 
   auto* oncp = ebpf_.Slice("oncpu_count");
   oncp->ForEach([&](const void* key, const void* value) {
@@ -319,29 +351,41 @@ void DeepCollector::DumpDeepMaps(const Config& /*cfg*/) {
     u64 count = *(const u64*)value;
     std::string us = Folded(k->user_sid, k->pid, true);
     std::string ks = Folded(k->kernel_sid, k->pid, false);
-    std::string line = ks.empty() ? us : (us.empty() ? ks : us + ";" + ks);
-    if (!line.empty()) folded_on_cpu += line + " " + std::to_string(count) + "\n";
+    std::string pc, tc;
+    if (auto it = tgid_comm.find(k->pid); it != tgid_comm.end()) pc = it->second;
+    if (auto it = tid_comm.find(k->tid); it != tid_comm.end()) tc = it->second;
+    std::string line = "p:" + std::to_string(k->pid) + "/" + pc + ";t:" +
+                       std::to_string(k->tid) + "/" + tc;
+    if (!ks.empty()) line += ";" + ks;   // kernel frames (root-first) near root
+    if (!us.empty()) line += ";" + us;   // user frames (root-first) at leaf side
+    writer_.WriteFoldedLine("on_cpu", line, count);
   });
-  writer_.WriteFolded("on_cpu.folded", folded_on_cpu);
 
   auto* offcp = ebpf_.Slice("offcpu_time");
   offcp->ForEach([&](const void* key, const void* value) {
     auto* k = (const OffcpuKey*)key;
     u64 dwell = *(const u64*)value;
     std::string ks = Folded(k->ksid, k->tid, false);
-    if (!ks.empty()) folded_off_cpu += ks + " " + std::to_string(dwell) + "\n";
+    if (ks.empty()) return;
+    std::string line;
+    auto tg = tid_tgid.find(k->tid);
+    if (tg != tid_tgid.end()) {
+      const std::string& c = tid_comm[k->tid];
+      line = "p:" + std::to_string(tg->second) + "/" + c +
+             ";t:" + std::to_string(k->tid) + "/" + c;
+    } else {
+      line = "t:" + std::to_string(k->tid) + "/";   // no attribution: t frame only
+    }
+    writer_.WriteFoldedLine("off_cpu", line + ";" + ks, dwell);
   });
-  writer_.WriteFolded("off_cpu.folded", folded_off_cpu);
 
   auto* lockhot = ebpf_.Slice("lock_hot");
   lockhot->ForEach([&](const void* key, const void* value) {
     u64 addr = *(const u64*)key;
     auto* v = (const LockHotVal*)value;
-    lock << "0x" << std::hex << addr << std::dec << " count=" << v->count
-         << " total_wait_ns=" << v->lat_sum
-         << " avg_wait_ns=" << (v->count ? v->lat_sum / v->count : 0) << "\n";
+    std::string sym = ebpf_.sym().KernelSym(addr);
+    writer_.WriteDeepLock(addr, v->count, v->lat_sum, sym.c_str());
   });
-  writer_.WriteText("lock_contention.txt", lock.str());
 
   auto* runq_slice = ebpf_.Slice("runq_st");
   runq_slice->ForEach([&](const void* key, const void* value) {
@@ -349,20 +393,19 @@ void DeepCollector::DumpDeepMaps(const Config& /*cfg*/) {
     auto* v = (const LatStatVal13*)value;
     float p50 = PercentileUs(v->hist, 13, 256, 4, 0.50);
     float p99 = PercentileUs(v->hist, 13, 256, 4, 0.99);
-    runq << "tid=" << tid << " count=" << v->count
-         << " avg_us=" << (v->count ? (double)v->lat_sum / v->count / 1000.0 : 0)
-         << " p50_us=" << p50 << " p99_us=" << p99 << "\n";
+    writer_.WriteDeepRunq(tid, v->count,
+                          v->count ? (float)((double)v->lat_sum / v->count / 1000.0) : 0.0f,
+                          p50, p99);
   });
-  writer_.WriteText("runq_latency.txt", runq.str());
 
   auto* iofile = ebpf_.Slice("io_file");
   iofile->ForEach([&](const void* key, const void* value) {
     auto* k = (const IoFileKey*)key;
     auto* v = (const IoFileVal*)value;
-    iof << "dev=0x" << std::hex << k->dev << std::dec << " ino=" << k->ino
-        << " path=" << k->path << " bytes=" << v->bytes << " ops=" << v->ops << "\n";
+    writer_.WriteDeepIoFile(k->dev, k->ino, k->path, v->bytes, v->ops);
   });
-  writer_.WriteText("io_files.txt", iof.str());
+
+  writer_.CommitBatch();
 }
 
 void DeepCollector::Finalize(const Config& cfg, nlohmann::json& summary_json) {

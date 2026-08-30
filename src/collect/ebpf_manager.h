@@ -20,12 +20,15 @@ namespace etrace_diag {
 class StackSymbolizer {
  public:
   StackSymbolizer();
-  // ips[0..n) are leaf-first. `user` selects user vs kernel resolution.
+  // ips[0..n) are leaf-first; the returned string is root-first (input order reversed), so flame graphs read top-down without client-side flipping. `user` selects user vs kernel resolution.
   std::string Resolve(u32 pid, const uint64_t* ips, int n, bool user);
+
+  // Resolve a kernel address to "name+0xoff" (or hex fallback). Public so DEEP
+  // lock-address symbols can be resolved for storage.
+  std::string KernelSym(uint64_t ip) const;
 
  private:
   void LoadKallsyms();
-  std::string KernelSym(uint64_t ip) const;
   std::string UserSym(u32 pid, uint64_t ip);
 
   struct Mapping {

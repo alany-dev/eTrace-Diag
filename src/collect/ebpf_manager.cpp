@@ -116,8 +116,8 @@ std::string StackSymbolizer::UserSym(u32 pid, uint64_t ip) {
 
 std::string StackSymbolizer::Resolve(u32 pid, const uint64_t* ips, int n, bool user) {
   std::string out;
-  for (int i = 0; i < n; ++i) {
-    if (ips[i] == 0) break;
+  for (int i = n - 1; i >= 0; --i) {
+    if (ips[i] == 0) continue;
     if (!out.empty()) out += ";";
     std::string sym = user ? UserSym(pid, ips[i]) : KernelSym(ips[i]);
     // sanitize: folded frames must not contain ';' or spaces
