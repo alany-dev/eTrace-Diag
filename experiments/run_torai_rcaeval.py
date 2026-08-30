@@ -157,6 +157,7 @@ def main(argv=None) -> int:
     p.add_argument("--seeds", default="7")
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--start", type=int, default=0, help="skip first N cases (resume)")
+    p.add_argument("--out-cases", default="", help="write per-case results JSON here")
     p.add_argument("--logs", action="store_true", help="include logs modality (RE2/RE3)")
     p.add_argument("--traces", action="store_true", help="include traces modality (RE2/RE3 OB/TT)")
     args = p.parse_args(argv)
@@ -171,6 +172,7 @@ def main(argv=None) -> int:
 
     seeds = [int(s) for s in args.seeds.split(",")]
     rca = ToraiRCA({"torai": {"variant": args.variant}}, seed=seeds[0])
+    row_map = {r["case"]: r for _, r in suite.iterrows()}
     hits = {k: [] for k in (1, 3, 5)}
     per_case: dict[str, dict] = {}
     t0 = time.time()
@@ -197,7 +199,9 @@ def main(argv=None) -> int:
             hits[k].append(ev[k])
         per_case[row["case"]] = {"root": row["root_cause_service"], "top3": ranks[:3],
                                  "rank": (ranks.index(row["root_cause_service"]) + 1
-                                          if row["root_cause_service"] in ranks else -1)}
+                                          if row["root_cause_service"] in ranks else -1),
+                                 "system": row["system"], "fault": row["fault"],
+                                 "hit1": ev[1], "hit3": ev[3], "hit5": ev[5]}
         if len(hits[1]) % 10 == 0:
             print(f"  [{len(hits[1])}/{len(suite)}] {row['case']} rank={per_case[row['case']]['rank']}",
                   file=sys.stderr, flush=True)
@@ -205,6 +209,24 @@ def main(argv=None) -> int:
     n = len(hits[1]) or 1
     ac = {k: round(sum(v) / n, 4) for k, v in hits.items()}
     avg5 = round((ac[1] + ac[3] + ac[5]) / 3, 4)
+
+    def _agg(key):
+        groups: dict = {}
+        for c, v in per_case.items():
+            if "rank" not in v or v["rank"] < 0:
+                continue
+            g = row_map.get(c, {}).get(key, "?")
+            e = groups.setdefault(g, {"n": 0, "hit1": 0, "hit3": 0, "hit5": 0})
+            e["n"] += 1
+            e["hit1"] += v["hit1"]; e["hit3"] += v["hit3"]; e["hit5"] += v["hit5"]
+        out = {}
+        for g, e in groups.items():
+            out[g] = {"n": e["n"],
+                      "ac@1": round(e["hit1"] / e["n"], 4),
+                      "ac@3": round(e["hit3"] / e["n"], 4),
+                      "ac@5": round(e["hit5"] / e["n"], 4),
+                      "avg@5": round((e["hit1"] + e["hit3"] + e["hit5"]) / 3 / e["n"], 4)}
+        return out
     out = {
         "suite": args.suite, "variant": args.variant, "seeds": args.seeds,
         "n_cases": n, "total": len(suite),
@@ -212,7 +234,11 @@ def main(argv=None) -> int:
         "total_s": round(time.time() - t0, 1),
         "modalities": "metric" + ("+log" if args.logs else "") + ("+trace" if args.traces else ""),
         "failures": [{"case": c, **v} for c, v in per_case.items() if "reason" in v],
+        "by_fault": _agg("fault"),
+        "by_system": _agg("system"),
     }
+    if args.out_cases:
+        Path(args.out_cases).write_text(json.dumps(per_case, indent=2))
     print(json.dumps({k: v for k, v in out.items() if k != "per_case"}, indent=2))
     return 0
 

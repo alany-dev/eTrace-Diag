@@ -22,7 +22,9 @@
   （median/IQR 单源）、correlation（Pearson 下界）、Anomaly Transformer（真实运行）。
 
 研究出处、数据许可、评估协议见 `docs/research/`（model-matrix / data-matrix /
-evaluation-protocol）。
+evaluation-protocol）。TORAI 架构详解（从零入门，基准版 vs 改进版逐模块）：
+`docs/research/torai-architecture.md`；实测指标详录（RCAeval RE1/RE2/RE3 +
+AIOps 2020，分故障/分系统/逐案例）：`docs/research/torai-benchmark-results.md`。
 
 TORAI 复现：`experiments/run_torai.py --dataset torai-ob --variant faithful --seeds 7,11,19`
 （需先按 `experiments/download_torai_data.py` 从 Figshare 获取官方

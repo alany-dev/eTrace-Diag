@@ -58,6 +58,10 @@ implementation; this project targets Python 3.11.
 
 ### Model 2 design decisions (TORAI)
 
+Architecture deep-dive (module-by-module, from-zero background):
+`torai-architecture.md`; measured metrics (per fault/system/case):
+`torai-benchmark-results.md`.
+
 - The causal core is **TORAI** (`src/alg_models/causal/torai.py`): per-modality
   anomaly severity (vectorized max-|z|), fine→coarse aggregation (addup for
   metric/traces, highest for logs), GMM symptom clustering with BIC selection,
