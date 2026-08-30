@@ -51,6 +51,11 @@ void Logger::SetLevel(LogLevel level) {
   level_ = level;
 }
 
+void Logger::SetSink(std::function<void(const std::string&)> sink) {
+  std::lock_guard<std::mutex> g(mu_);
+  sink_ = std::move(sink);
+}
+
 void Logger::Log(LogLevel lvl, const char* fmt, ...) {
   if (static_cast<int>(lvl) < static_cast<int>(level_)) return;
 
@@ -74,6 +79,7 @@ void Logger::Log(LogLevel lvl, const char* fmt, ...) {
   std::lock_guard<std::mutex> g(mu_);
   (void)!write(2, line, static_cast<size_t>(n));
   if (fd_ >= 0) (void)!write(fd_, line, static_cast<size_t>(n));
+  if (sink_ && n > 1) sink_(std::string(line, static_cast<size_t>(n) - 1));
 }
 
 void LogDebug(const char* fmt, ...) {

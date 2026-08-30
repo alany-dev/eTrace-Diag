@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdarg>
+#include <functional>
 #include <mutex>
 #include <string>
 
@@ -19,6 +20,10 @@ class Logger {
   void SetLevel(LogLevel level);
   LogLevel Level() const { return level_; }
 
+  // Registers a callback receiving every emitted log line WITHOUT the
+  // trailing '\n' (wired to the SQLite logs table in app.cpp).
+  void SetSink(std::function<void(const std::string&)> sink);
+
   void Log(LogLevel lvl, const char* fmt, ...) __attribute__((format(printf, 3, 4)));
 
  private:
@@ -26,6 +31,7 @@ class Logger {
   std::mutex mu_;
   int fd_ = -1;           // log file fd (-1 = closed)
   LogLevel level_ = LogLevel::kInfo;
+  std::function<void(const std::string&)> sink_;
 };
 
 void LogDebug(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
