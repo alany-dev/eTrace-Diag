@@ -286,8 +286,9 @@ int RunCollector(const Config& initial, const std::string& config_path, uint64_t
     LogError("cannot initialize output directory '%s'", initial.output.dir.c_str());
     return 1;
   }
-  Logger::Instance().Init(writer.session_dir() + "/log.txt",
-                          ParseLogLevel(initial.misc.log_level));
+  Logger::Instance().Init("", ParseLogLevel(initial.misc.log_level));
+  // Every log line lands in the DB logs table from the very first message.
+  Logger::Instance().SetSink([&writer](const std::string& line) { writer.WriteLogLine(line); });
   LogInfo("session dir: %s", writer.session_dir().c_str());
 
   std::string bpf_stats_prev;
@@ -355,15 +356,18 @@ int RunCollector(const Config& initial, const std::string& config_path, uint64_t
         if (procs.size() > 200) procs.resize(200);
         last_host.procs = std::move(procs);
       }
+      writer.BeginBatch();
       writer.WriteHostRow(last_host);
       DumpMemEvents(ebpf, writer, last_host.ts_ns);
       DumpOomEvents(ebpf, writer);
       DumpIoDevices(ebpf, writer, last_host.ts_ns);
+      writer.CommitBatch();
       next_host = now + cfg->sample.base_host_interval_ms * 1000000ULL;
     }
 
     if (now >= next_overhead) {
       ProcOverhead po = BuildProcOverhead(now);
+      writer.BeginBatch();
       writer.WriteProcOverhead(po);
       if (bpf_stats_ok) {
         BpfStatsSnapshot bs;
@@ -373,6 +377,7 @@ int RunCollector(const Config& initial, const std::string& config_path, uint64_t
         ebpf.CollectProgramStats(bs.progs);
         writer.WriteBpfStats(bs);
       }
+      writer.CommitBatch();
       last_overhead_ts = now;
       next_overhead = now + cfg->sample.overhead_interval_ms * 1000000ULL;
     }
@@ -382,11 +387,12 @@ int RunCollector(const Config& initial, const std::string& config_path, uint64_t
                                         selector.member_threads(), selector.member_processes());
       nlohmann::json j;
       to_json(j, f);
+      writer.BeginBatch();
       writer.WriteAnomalyFeatures(j);
+      writer.CommitBatch();
       phase.TickAnomaly(*cfg, f, f.ts_ns);
       next_feature = now + cfg->sample.base_feature_interval_ms * 1000000ULL;
     }
-
     if (now >= next_topk) {
       selector.Evaluate(*cfg);
       next_topk = now + cfg->targets.eval_interval_ms * 1000000ULL;
@@ -417,8 +423,8 @@ int RunCollector(const Config& initial, const std::string& config_path, uint64_t
   phase.Shutdown(*cfg, NowNs());
   ebpf.StopSnapshotter();
   ebpf.Close();
+  writer.Close();  // WAL checkpoint + 关闭，主文件自含（前端 sql.js 只读主文件）
   RestoreBpfStats(bpf_stats_prev);
-  LogInfo("collector stopped");
   return 0;
 }
 

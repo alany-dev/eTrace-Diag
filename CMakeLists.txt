@@ -126,6 +126,7 @@ endif()
 add_dependencies(etrace-diag bpf_artifacts)
 
 find_package(Threads REQUIRED)
+find_package(SQLite3 REQUIRED)
 
 target_link_directories(etrace-diag PRIVATE ${ETD_LIBBPF_LIBRARY_DIRS})
 
@@ -134,7 +135,8 @@ target_link_libraries(etrace-diag PRIVATE
   elf
   z
   ${CMAKE_DL_LIBS}
-  Threads::Threads)
+  Threads::Threads
+  SQLite::SQLite3)
 
 # ---------------------------------------------------------------------------
 # Tests (build-time only; runtime verification needs root/CAP_BPF)
