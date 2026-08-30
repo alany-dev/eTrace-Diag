@@ -8,3 +8,4 @@ CMakeFiles/
 cmake_install.cmake
 compile_commands.json
 _deps/
+node_modules/

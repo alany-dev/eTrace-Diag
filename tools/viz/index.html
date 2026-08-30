@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>eTrace-Diag 会话可视化</title>
+  <link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+  <header id="topbar">
+    <span id="appTitle">eTrace-Diag 会话可视化</span>
+    <select id="selSession" disabled></select>
+    <button id="btnReload" disabled>重新加载</button>
+    <span id="lblStatus"></span>
+    <span class="spacer"></span>
+    <label><input type="checkbox" id="chkLink" checked> 联动缩放</label>
+    <label><input type="checkbox" id="chkEvents" checked> 事件标记</label>
+    <button id="btnExport">导出面板</button>
+    <button id="btnImport">导入面板</button>
+    <input type="file" id="fileImport" accept=".json" hidden>
+  </header>
+
+  <nav id="tabs">
+    <button data-tab="dash" class="active">总览</button>
+    <button data-tab="deep">DEEP 取证</button>
+    <button data-tab="logs">日志与事件</button>
+  </nav>
+
+  <main>
+    <section id="tab-dash">
+      <div id="cards"></div>
+      <div id="panelHost"></div>
+      <button id="btnAddPanel">+ 添加面板</button>
+    </section>
+
+    <section id="tab-deep" hidden>
+      <div class="bar">
+        <select id="selEpisode"></select>
+        <button id="btnLoadDeep">加载该取证</button>
+        <span id="deepProgress"></span>
+      </div>
+      <div id="deepSummary"></div>
+      <nav id="deepTabs">
+        <button data-dt="series" class="active">逐线程趋势</button>
+        <button data-dt="flame">火焰图</button>
+        <button data-dt="hot">热点表</button>
+      </nav>
+      <div id="dtSeries"></div>
+      <div id="dtFlame" hidden></div>
+      <div id="dtHot" hidden></div>
+    </section>
+
+    <section id="tab-logs" hidden>
+      <div class="bar" id="logCtl"></div>
+      <div id="logView"></div>
+      <h3>targets 成员变更</h3><div id="tblTargets"></div>
+      <h3>内存/OOM 事件</h3><div id="tblMemev"></div>
+    </section>
+  </main>
+
+  <dialog id="dlgPanel"></dialog>
+
+  <script src="vendor/sql-wasm.js"></script>
+  <script src="js/util.js"></script>
+  <script src="js/db.js"></script>
+  <script src="js/parse.js"></script>
+  <script src="js/chart.js"></script>
+  <script src="js/flame.js"></script>
+  <script src="js/panels.js"></script>
+  <script src="js/ui.js"></script>
+  <script src="js/main.js"></script>
+</body>
+</html>

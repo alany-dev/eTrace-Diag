@@ -1,0 +1,155 @@
+/* eTrace-Diag 会话可视化 — 暗色主题 */
+:root {
+  --bg: #0d1117;
+  --panel: #161b22;
+  --border: #30363d;
+  --fg: #c9d1d9;
+  --fg-dim: #8b949e;
+  --accent: #58a6ff;
+  --warn: #d29922;
+  --err: #f85149;
+  --ok: #3fb950;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; background: var(--bg); color: var(--fg);
+  font: 13px/1.45 system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
+body { padding-bottom: 60px; }
+button, select, input { font: inherit; color: inherit; background: var(--panel);
+  border: 1px solid var(--border); border-radius: 6px; padding: 4px 10px; }
+button { cursor: pointer; }
+button:hover:not(:disabled) { border-color: var(--accent); }
+button:disabled { opacity: .45; cursor: not-allowed; }
+input[type=checkbox] { vertical-align: -2px; }
+
+#topbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--border);
+  position: sticky; top: 0; z-index: 20; }
+#appTitle { font-weight: 700; font-size: 15px; color: var(--accent); margin-right: 8px; }
+#lblStatus { color: var(--fg-dim); }
+#lblStatus.warn { color: var(--warn); }
+#lblStatus.err { color: var(--err); }
+.spacer { flex: 1; }
+
+#tabs { display: flex; gap: 4px; padding: 8px 16px 0; border-bottom: 1px solid var(--border); }
+#tabs button { border-radius: 6px 6px 0 0; border-bottom: none; background: transparent; }
+#tabs button.active { background: var(--panel); color: var(--accent); border-color: var(--border); }
+
+main { padding: 14px 16px; }
+
+/* 卡片行 */
+#cards { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 16px; }
+.card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+  padding: 10px 14px; min-width: 150px; }
+.card .card-title { color: var(--fg-dim); font-size: 12px; }
+.card .card-val { font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums; margin: 2px 0; }
+.card .card-sub { color: var(--fg-dim); font-size: 11px; }
+.card .card-val.stage-deep { color: var(--err); }
+
+/* 面板 */
+#panelHost { display: flex; flex-direction: column; gap: 10px; }
+.panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+  overflow: hidden; }
+.panel.dragover-top { border-top: 2px solid var(--accent); }
+.panel.dragover-bottom { border-bottom: 2px solid var(--accent); }
+.panel-head { display: flex; align-items: center; gap: 8px; padding: 6px 12px;
+  border-bottom: 1px solid var(--border); background: rgba(255,255,255,.02); }
+.panel-head .drag { cursor: grab; color: var(--fg-dim); }
+.panel-head .p-title { font-weight: 600; flex: 1; }
+.panel-head button { padding: 1px 8px; }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 14px; padding: 6px 12px 0; }
+.legend .legend-chip { display: inline-flex; align-items: center; gap: 5px; cursor: pointer;
+  user-select: none; }
+.legend .legend-chip.off { opacity: .35; text-decoration: line-through; }
+.legend .legend-chip .chip-color { width: 10px; height: 10px; border-radius: 2px; }
+.legend-group { font-weight: 600; color: var(--fg-dim); }
+.legend-group ul { margin: 0 0 2px 14px; padding: 0; list-style: none; }
+.legend-group ul li { display: inline-flex; align-items: center; gap: 5px; margin-right: 10px; }
+.plot { display: block; width: 100%; }
+#btnAddPanel { margin: 12px 0; }
+
+/* 图表 tooltip */
+.tt { position: absolute; pointer-events: none; background: rgba(13,17,23,.92);
+  border: 1px solid var(--border); border-radius: 6px; padding: 6px 9px; font-size: 12px;
+  z-index: 30; max-width: 420px; }
+.tt .tt-line { white-space: nowrap; }
+
+/* DEEP tab */
+.bar { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; }
+#deepSummary { margin-bottom: 12px; }
+#deepSummary table { border-collapse: collapse; width: 100%; background: var(--panel);
+  border: 1px solid var(--border); border-radius: 8px; font-size: 12px; }
+#deepSummary td, #deepSummary th { border: 1px solid var(--border); padding: 4px 8px;
+  vertical-align: top; text-align: left; }
+#deepSummary th { width: 220px; color: var(--fg-dim); font-weight: 500; }
+#deepSummary pre { background: #0b0f14; padding: 10px; border-radius: 6px;
+  font: 12px/1.5 var(--mono); overflow: auto; white-space: pre-wrap; }
+#deepTabs { display: flex; gap: 4px; margin-bottom: 10px; }
+#deepTabs button { border-radius: 6px 6px 0 0; border-bottom: none; background: transparent; }
+#deepTabs button.active { background: var(--panel); color: var(--accent); }
+#dtSeries { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 10px; }
+#dtSeries .deep-tile { background: var(--panel); border: 1px solid var(--border);
+  border-radius: 8px; padding: 6px; cursor: pointer; overflow: hidden; }
+#dtSeries .deep-tile:hover { border-color: var(--accent); }
+#dtSeries .deep-tile-title { font-size: 12px; color: var(--fg-dim); margin: 2px 6px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* 放大趋势弹窗 */
+#dlgTrend { min-width: 780px; max-width: 92vw; padding: 12px 16px; }
+#dlgTrend .dlg-head { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
+#dlgTrend .dlg-head h3 { margin: 0; flex: 1; }
+#dlgTrend .dlg-close { padding: 2px 10px; }
+.ctlgroup { border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px;
+  background: var(--panel); }
+.ctlgroup h4 { margin: 0 0 6px; font-size: 12px; color: var(--fg-dim); }
+
+/* 火焰图 */
+#flameToolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
+  margin-bottom: 8px; }
+#flameBreadcrumb { display: flex; gap: 4px; align-items: center; font-size: 12px;
+  flex-wrap: wrap; }
+#flameBreadcrumb button { padding: 1px 7px; }
+#flameCanvas { display: block; background: #0b0f14; border: 1px solid var(--border);
+  border-radius: 6px; width: 100%; }
+#flameStatus { color: var(--fg-dim); font-size: 12px; min-height: 16px; }
+
+/* 热点表 / 日志表 */
+table.htable { border-collapse: collapse; width: 100%; background: var(--panel);
+  border: 1px solid var(--border); border-radius: 8px; font-size: 12px; margin-bottom: 14px; }
+table.htable th, table.htable td { border: 1px solid var(--border); padding: 4px 8px;
+  text-align: left; font-variant-numeric: tabular-nums; }
+table.htable th { color: var(--fg-dim); cursor: pointer; user-select: none;
+  background: rgba(255,255,255,.02); position: sticky; top: 0; }
+table.htable tr:hover td { background: rgba(88,166,255,.06); }
+table.htable .num { text-align: right; }
+.htable-wrap { max-height: 300px; overflow: auto; margin-bottom: 8px; }
+.hfilter { margin-bottom: 4px; width: 260px; }
+.hot-section h4 { margin: 10px 0 4px; color: var(--fg-dim); }
+
+/* 日志 tab */
+.lv-INFO { color: var(--ok); } .lv-WARN { color: var(--warn); }
+.lv-ERROR { color: var(--err); } .lv-DEBUG { color: var(--fg-dim); }
+#logView { background: #0b0f14; border: 1px solid var(--border); border-radius: 8px;
+  max-height: 480px; overflow: auto; font: 12px/1.5 var(--mono); margin-bottom: 16px; }
+.log-line { display: flex; gap: 8px; padding: 1px 10px; }
+.log-line:hover { background: rgba(88,166,255,.06); }
+.log-line .log-ts { color: var(--fg-dim); white-space: nowrap; }
+.log-line .log-msg { white-space: pre-wrap; word-break: break-all; flex: 1; }
+.log-line button { padding: 0 6px; font-size: 11px; }
+#logCtl .chip { border-radius: 12px; padding: 2px 10px; }
+#logCtl .chip.on { background: var(--accent); color: #0d1117; border-color: var(--accent); }
+
+/* 表格区标题 */
+main h3 { color: var(--fg-dim); font-weight: 600; margin: 18px 0 6px; }
+
+dialog { background: var(--panel); color: var(--fg); border: 1px solid var(--border);
+  border-radius: 10px; min-width: 560px; max-width: 90vw; }
+dialog::backdrop { background: rgba(0,0,0,.55); }
+#dlgPanel .dlg-row { margin: 8px 0; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+#dlgPanel .dlg-row label { min-width: 70px; color: var(--fg-dim); }
+#dlgPanel .sel-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+#dlgPanel .sel-chip { display: inline-flex; align-items: center; gap: 6px;
+  border: 1px solid var(--border); border-radius: 12px; padding: 2px 6px 2px 10px; }
+#dlgPanel .sel-chip button { padding: 0 5px; border: none; background: none; }
+#dlgPanel select[multiple] { min-height: 120px; }
+#dlgPanel optgroup { color: var(--fg); }
