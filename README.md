@@ -45,6 +45,7 @@ RunCollector (app.cpp) ── 单线程 tick 调度（host / feature / topk / de
 | 权限 | root，或 `CAP_BPF` + `CAP_PERFMON` + `CAP_SYS_ADMIN` |
 | 架构 | x86_64 / arm64 |
 | 构建工具 | cmake ≥ 3.16、clang（BPF target，llvm 14+）、bpftool、libbpf（系统包或自动构建）、libelf、zlib |
+| 运行时库 | sqlite3 开发包（会话输出以单文件 SQLite 落盘） |
 | 运行时（可选） | stress-ng、fio（复现场景）、python3（mock 模型） |
 
 ## 构建
@@ -76,19 +77,29 @@ kill -INT  <pid>   # 干净退出（DEEP 先 finalize）
 输出会话目录 `out/<YYYYmmdd-HHMMSS>_<pid>/`：
 
 ```
-base_host.jsonl        主机指标（cpu/loadavg/meminfo/vmstat/PSI/diskstats/进程表） 1s
-base_anomaly.jsonl     异常特征向量（发给模型） 1s
-targets.log            top-k 成员 join/leave（tgid、score、进程 rank）
-bpf_stats.jsonl        每个 BPF 程序 run_cnt/run_time_ns（内核开销精确归属） 1s
-proc_overhead.jsonl    用户态 CPU/切换/缺页 + RSS/HWM 1s
-io_devices.txt / memory_events.txt   设备 IO / 内存事件
-deep/<N>/              每次异常：
-  pre_series.jsonl / post_series.jsonl  飞行记录器窗口（100ms/20ms）
-  host_series.jsonl    DEEP 期间主机序列
-  on_cpu.folded / off_cpu.folded       折叠调用栈
-  syscall_hotspot.txt / lock_contention.txt / runq_latency.txt / io_files.txt
-  meta.json / summary.txt
+etrace.sqlite3   单文件会话库（WAL 已 checkpoint，自含可复制）。
+                 22 张表：meta / host / host_cpu / host_disk / host_proc /
+                 anomaly / anomaly_tid / targets_log / oom_events /
+                 memory_events / io_devices / bpf_stats / proc_overhead / logs /
+                 deep_episodes / deep_series / deep_gap / deep_folded /
+                 deep_syscall / deep_lock / deep_runq / deep_iofile。
+                 每采集 tick 一个事务；退出前 WAL 合并，文件可独立分发。
 ```
+
+## 可视化
+
+```bash
+# 启动静态服务：站点根 = tools/viz/ 页面；/out/ = 会话输出目录（默认 <项目根>/out）
+python3 tools/viz/serve.py            # 默认 http://127.0.0.1:8901/
+python3 tools/viz/serve.py --port 9000 --out /data/runs   # 自定义端口与输出目录
+```
+
+打开 <http://127.0.0.1:8901/>：自动列出 `out/` 下全部会话（探测各目录的 `etrace.sqlite3`），
+默认加载最新一个；更换输出根目录可用浏览器参数 `?out=/路径` 或启动参数 `--out`。
+
+- 无构建步骤：vendored sql.js（WASM）在浏览器内直接读 SQLite；`serve.py` 仅做静态文件服务，也可用任意静态服务器替代（需同时暴露 `tools/viz/` 与会话目录，否则用 `?out=` 指定）。
+- 功能面：总览卡片、可编排趋势面板（添加/编辑/拖拽排序/双语纲自动双轴/联动缩放，布局持久化于 localStorage，可导入导出）、DEEP 取证（逐线程趋势小方块 + 点击放大、on/off-CPU 火焰图带面包屑、热点表）、日志检索 + 「定位到图表时段」。
+- 测试（node 环境，无需浏览器）：`node tools/viz/test/smoke.mjs <会话目录>`；`node tools/viz/test/dom.mjs <会话目录>`（jsdom，需先 `npm i`，仅此一处用到）。
 
 ## 配置
 
@@ -140,6 +151,7 @@ config/             默认配置
 include/etrace_diag/ 公共头（config/metrics/output_writer/model_client/app）
 src/                C++ 实现（collect/ model/ output/ 及主循环）
 scripts/            构建、运行、mock 模型、场景复现
+tools/viz/          浏览器端会话可视化（静态页面 + serve.py + node 测试）
 tests/              构建期测试（config_probe）
 third_party/        vendored 单头 nlohmann/json
 docs/               架构说明 + 开销基线
