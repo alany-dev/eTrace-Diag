@@ -48,9 +48,10 @@ main { padding: 14px 16px; }
 .card .card-val.stage-deep { color: var(--err); }
 
 /* 面板 */
-#panelHost { display: flex; flex-direction: column; gap: 10px; }
+/* 小方块网格：与 DEEP 逐线程趋势同形态，点击放大 */
+#panelHost { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 10px; }
 .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
-  overflow: hidden; }
+  overflow: hidden; cursor: pointer; }
 .panel.dragover-top { border-top: 2px solid var(--accent); }
 .panel.dragover-bottom { border-bottom: 2px solid var(--accent); }
 .panel-head { display: flex; align-items: center; gap: 8px; padding: 6px 12px;

@@ -404,7 +404,7 @@
 
     dlg.appendChild(dlgRow('标题', titleIn));
     dlg.appendChild(dlgRow('类型', kindSel));
-    dlg.appendChild(dlgRow('高度', heightIn));
+    dlg.appendChild(dlgRow('弹窗高度', heightIn));
     dlg.appendChild(dlgRow('已选序列', chipsHost));
     dlg.appendChild(dlgRow('数据源', srcSel));
     dlg.appendChild(dlgRow('指标', familySel));

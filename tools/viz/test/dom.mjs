@@ -136,7 +136,15 @@ check(!!stageCard && stageCard.textContent.includes('BASE / 已结束'), '阶段
 const panels = document.querySelectorAll('#panelHost .panel');
 check(panels.length === 8, `默认 8 面板 (${panels.length})`);
 const cpuPanel = [...panels].find((p) => p.querySelector('.p-title').textContent === 'CPU 利用率');
-check(!!cpuPanel && cpuPanel.querySelectorAll('.legend-chip').length === 2, 'CPU 面板 2 序列图例');
+check(!!cpuPanel && cpuPanel.querySelectorAll('canvas').length === 1, 'CPU 面板小方块含趋势图');
+// 小方块（无图例）→ 点击弹完整窗口（含图例与交互）
+cpuPanel.click();
+await new Promise((r) => setTimeout(r, 150));
+const dlg0 = document.getElementById('dlgTrend');
+check(!!dlg0 && dlg0.open, '总览小方块点击后打开放大弹窗');
+const chips = dlg0 ? dlg0.querySelectorAll('.legend-chip').length : 0;
+check(chips === 2, `放大弹窗含 2 条图例 (${chips})`);
+if (dlg0 && dlg0.close) dlg0.close();
 
 // ---- deep tab ----
 const selEp = $('selEpisode');

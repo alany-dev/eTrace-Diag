@@ -79,25 +79,11 @@
     return host;
   };
 
-  // render one panel definition -> DOM
-  V.renderPanel = function (session, def, link) {
-    const panel = V.el('div', { class: 'panel', 'data-id': def.id });
-    const head = V.el('div', { class: 'panel-head' },
-      [V.el('span', { class: 'drag', draggable: 'true', title: '拖拽排序' }, '⠿'),
-       V.el('span', { class: 'p-title' }, def.title),
-       V.el('button', { class: 'p-edit', title: '编辑' }, '✎'),
-       V.el('button', { class: 'p-del', title: '删除' }, '✕')]);
-    panel.appendChild(head);
-
-    const canvas = document.createElement('canvas');
-    canvas.style.height = (def.height || 220) + 'px';
-    const chart = new V.TChart(canvas, {
-      link, height: def.height || 220, events: session.events, bands: session.bands, wall: session.wall,
-    });
-    panel._chart = chart;
-    // add series from def
+  // 展开一个面板定义的全部 series → [{id,label,x,y,unit,scaleName,kind,scale}]，
+  // 小方块与「点击放大」共用同一份解析逻辑；2 个量纲时第 2 个上右轴。
+  function collectPanelLines(session, def) {
     const kind = def.kind === 'area' ? 'area' : def.kind === 'step' ? 'step' : 'line';
-    const adds = [];   // 先收集，再按量纲分左右轴
+    const adds = [];
     for (const entry of def.series) {
       if (entry.mid) {
         const s = session.store.get(entry.mid);
@@ -105,7 +91,7 @@
           adds.push({ id: entry.mid, label: s.label, x: s.x, y: s.y,
                       unit: s.unit, scaleName: V.scaleOf(entry.mid), kind });
         } else {
-          // no data for mid in this session — draw empty placeholder series
+          // 本会话无此指标数据 → 占位空序列（图例里保留条目）
           adds.push({ id: entry.mid + ':empty', label: entry.mid + '（无数据）', x: [], y: [], kind });
         }
       } else if (entry.family) {
@@ -119,12 +105,36 @@
         }
       }
     }
-    // 面板涉及 2 个量纲时第 2 个上右轴；>2 个（旧配置残留）其余回左轴
     const scaleOrder = [...new Set(adds.map((a) => a.scaleName).filter(Boolean))];
     const sideOf = (sn) => (sn && scaleOrder[1] === sn ? 'right' : 'left');
-    for (const a of adds) chart.addSeries({ ...a, scale: sideOf(a.scaleName) });
+    return adds.map((a) => ({ ...a, scale: sideOf(a.scaleName) }));
+  }
 
+  // render one panel definition -> DOM
+  V.renderPanel = function (session, def, link) {
+    const panel = V.el('div', { class: 'panel', 'data-id': def.id });
+    const head = V.el('div', { class: 'panel-head' },
+      [V.el('span', { class: 'drag', draggable: 'true', title: '拖拽排序' }, '⠿'),
+       V.el('span', { class: 'p-title' }, def.title),
+       V.el('button', { class: 'p-edit', title: '编辑' }, '✎'),
+       V.el('button', { class: 'p-del', title: '删除' }, '✕')]);
+    panel.appendChild(head);
+
+    // 小方块：固定高度、无图例（与 DEEP 逐线程小方块一致的形态）
+    const canvas = document.createElement('canvas');
+    const chart = new V.TChart(canvas, {
+      link, height: 140, legend: false,
+      events: session.events, bands: session.bands, wall: session.wall,
+    });
+    panel._chart = chart;
+    for (const a of collectPanelLines(session, def)) chart.addSeries(a);
     panel.appendChild(chart.wrap);
+
+    // 点击小方块 → 全尺寸弹窗（拖拽/头部控件点击不触发）
+    panel.addEventListener('click', (e) => {
+      if (e.target.closest('.panel-head')) return;
+      if (chart.movedPx <= 5) V.openPanelViewDialog(session, def);
+    });
 
     // ---- drag & drop ordering ----
     const drag = head.querySelector('.drag');
@@ -369,7 +379,10 @@
   };
 
   // 点击小方块 → 弹窗放大查看单个趋势（全高交互图）
-  V.openTrendDialog = function (session, t) {
+  // 通用「点击小方块 → 全尺寸弹窗」：总览面板与 DEEP 趋势共用。
+  // opts: { link, height }
+  V.openChartDialog = function (session, title, lines, opts) {
+    opts = opts || {};
     let dlg = document.getElementById('dlgTrend');
     if (!dlg) {
       dlg = document.createElement('dialog');
@@ -377,23 +390,35 @@
       document.body.appendChild(dlg);
     }
     dlg.textContent = '';
-    const title = V.el('h3', {}, t.label);
+    const titleEl = V.el('h3', {}, title);
     const close = V.el('button', { class: 'dlg-close' }, '✕');
     close.addEventListener('click', () => dlg.close());
     const canvas = document.createElement('canvas');
-    const chart = new V.TChart(canvas, { link: V.ensureDeepLink(), height: 460,
+    const chart = new V.TChart(canvas, { link: opts.link || V.ensurePanelLink(),
+                                          height: opts.height || 460,
                                           events: session.events, bands: session.bands,
                                           wall: session.wall });
-    for (const line of t.lines) {
+    for (const line of lines) {
       chart.addSeries({ id: line.id, label: line.label, x: line.x, y: line.y,
-                       scale: 'left', unit: line.unit, scaleName: line.scaleName });
+                       scale: line.scale || 'left', unit: line.unit, scaleName: line.scaleName,
+                       kind: line.kind });
     }
-    dlg.appendChild(V.el('div', { class: 'dlg-head' }, [title, close]));
+    dlg.appendChild(V.el('div', { class: 'dlg-head' }, [titleEl, close]));
     dlg.appendChild(chart.wrap);
     V.showDialog(dlg);
     dlg.addEventListener('close', () => { chart.destroy(); dlg.textContent = ''; }, { once: true });
   };
 
+  // DEEP 趋势小方块放大（沿用深联动组）
+  V.openTrendDialog = function (session, t) {
+    V.openChartDialog(session, t.label, t.lines, { link: V.ensureDeepLink(), height: 460 });
+  };
+
+  // 总览面板小方块放大（沿用面板联动组；面板编辑的高度沿用为弹窗高度）
+  V.openPanelViewDialog = function (session, def) {
+    V.openChartDialog(session, def.title, collectPanelLines(session, def),
+                      { link: V.ensurePanelLink(), height: Math.max(def.height || 0, 320) });
+  };
   // 逐线程趋势：每个细粒度指标一张图（cpu/切换/IO/缺页/锁/syscall/futex/runq），
   // 默认按全窗口 on_cpu 增量 Top-8 tid 展开；gap 处插断点。
   V.buildDeepTrends = function (session, series, gaps) {

@@ -382,6 +382,7 @@
       const xTicks = V.xticks(lo, hi, iw);
       ctx.fillStyle = '#8b949e';
       ctx.textAlign = 'center';
+      let prevRight = -Infinity;   // 已画标签的右缘，防止碰撞
       for (const t of xTicks) {
         const x = px(t);
         ctx.beginPath(); ctx.moveTo(x, padT); ctx.lineTo(x, padT + ih);
@@ -389,6 +390,9 @@
         const label = this._wallLabel(t);
         const half = ctx.measureText(label).width / 2;
         const lx = Math.min(Math.max(x, padL + half), w - padR - half);
+        const lft = lx - half;
+        if (lft < prevRight + 6) continue;   // 与前标签过近则丢弃（网格线仍在）
+        prevRight = lx + half;
         ctx.fillText(label, lx, h - 4);
       }
       ctx.textAlign = 'left';
