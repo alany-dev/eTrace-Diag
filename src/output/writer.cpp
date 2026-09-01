@@ -21,12 +21,17 @@ enum Stmt : int {
   S_HOST_CPU_INS,
   S_HOST_DISK_INS,
   S_HOST_PROC_INS,
+  S_NET_STACK_INS,
+  S_NET_IFACE_INS,
+  S_NET_SOFTNET_INS,
+  S_GPU_DEV_INS,
+  S_CGROUP_INS,
+  S_CGROUP_IO_INS,
   S_ANOMALY_INS,
   S_ANOMALY_TID_INS,
   S_TARGETS_INS,
   S_OOM_INS,
   S_MEMEV_INS,
-  S_IODEV_INS,
   S_BPF_INS,
   S_OVERHEAD_INS,
   S_LOGS_INS,
@@ -40,6 +45,13 @@ enum Stmt : int {
   S_LOCK_INS,
   S_RUNQ_INS,
   S_IOFILE_INS,
+  S_DEEP_PROC_INS,
+  S_DEEP_IODEV_INS,
+  S_NET_FLOW_INS,
+  S_NET_DROP_INS,
+  S_NET_SOFTIRQ_INS,
+  S_DEEP_GPU_PROC_INS,
+  S_OFFCPU_INS,
   S_TID_COMM_LOOKUP,
   S_COUNT
 };
@@ -71,6 +83,20 @@ std::string HistJson(const uint32_t* h, int bins) {
   }
   out += "]";
   return out;
+}
+
+// Bind a uint64 that may be "invalid" as NULL (valid=false convention).
+void BindU64(sqlite3_stmt* st, int& c, uint64_t v, bool valid) {
+  if (valid)
+    sqlite3_bind_int64(st, c++, (sqlite3_int64)v);
+  else
+    sqlite3_bind_null(st, c++);
+}
+
+void BindBool(sqlite3_stmt* st, int& c, bool v) { sqlite3_bind_int(st, c++, v ? 1 : 0); }
+
+void BindText(sqlite3_stmt* st, int& c, const std::string& s) {
+  sqlite3_bind_text(st, c++, s.c_str(), -1, SQLITE_TRANSIENT);
 }
 
 // Cache the latest comm for a tid by consulting targets_log (join/leave rows).
@@ -108,7 +134,7 @@ const char* SyscallName(uint32_t nr) {
       /*88*/ "symlink", "readlink", "chmod", "fchmod", "chown", "fchown", "lchown", "umask",
       /*96*/ "gettimeofday", "getrlimit", "getrusage", "sysinfo", "times", "ptrace", "getuid", "syslog",
       /*104*/ "getgid", "setuid", "setgid", "geteuid", "getegid", "setpgid", "getppid", "getpgrp",
-      /*112*/ "setsid", "setreuid", "setregid", "getgroups", "setgroups", "setresuid", "getresuid", "setresgid",
+      /*112*/ "setsid", "setreuid", "setregid", "getgroups", "setgroups", "setresuid", "getresgid",
       /*120*/ "getresgid", "getpgid", "setfsuid", "setfsgid", "getsid", "capget", "capset", "rt_sigpending",
       /*128*/ "rt_sigtimedwait", "rt_sigqueueinfo", "rt_sigsuspend", "sigaltstack", "utime", "mknod", "uselib", "personality",
       /*136*/ "ustat", "statfs", "fstatfs", "sysfs", "getpriority", "setpriority", "sched_setparam", "sched_getparam",
@@ -155,35 +181,107 @@ const char* kDdl[] = {
     " cu_user INTEGER NOT NULL, cu_nice INTEGER NOT NULL, cu_sys INTEGER NOT NULL,"
     " cu_idle INTEGER NOT NULL, cu_iowait INTEGER NOT NULL, cu_irq INTEGER NOT NULL,"
     " cu_softirq INTEGER NOT NULL, cu_steal INTEGER NOT NULL,"
+    " cu_guest INTEGER, cu_guest_nice INTEGER,"
     " load1 REAL, load5 REAL, load15 REAL, nr_running INTEGER, nr_threads INTEGER,"
     " mem_total_kb INTEGER, mem_avail_kb INTEGER, mem_free_kb INTEGER, buffers_kb INTEGER,"
     " cached_kb INTEGER, swap_total_kb INTEGER, swap_free_kb INTEGER, anon_pages_kb INTEGER,"
+    " sreclaimable_kb INTEGER, shmem_kb INTEGER, dirty_kb INTEGER, writeback_kb INTEGER,"
+    " commit_limit_kb INTEGER, committed_as_kb INTEGER, mem_valid_mask INTEGER,"
     " vm_pgfault INTEGER, vm_pgmajfault INTEGER, vm_pswpin INTEGER, vm_pswpout INTEGER,"
-    " vm_free_pages INTEGER, vm_anon_pages INTEGER,"
-    " psi_cpu10 REAL, psi_cpu60 REAL, psi_cpu300 REAL,"
-    " psi_io10 REAL, psi_io60 REAL, psi_io300 REAL,"
-    " psi_mem10 REAL, psi_mem60 REAL, psi_mem300 REAL)",
+    " vm_pgscan_kswapd INTEGER, vm_pgscan_direct INTEGER, vm_pgsteal_kswapd INTEGER,"
+    " vm_pgsteal_direct INTEGER, vm_workingset_refault INTEGER, vm_nr_dirty INTEGER,"
+    " vm_nr_writeback INTEGER, vm_valid_mask INTEGER,"
+    " psi_cpu_s10 REAL, psi_cpu_s60 REAL, psi_cpu_s300 REAL, psi_cpu_s_valid INTEGER,"
+    " psi_cpu_f10 REAL, psi_cpu_f60 REAL, psi_cpu_f300 REAL, psi_cpu_f_valid INTEGER,"
+    " psi_io_s10 REAL, psi_io_s60 REAL, psi_io_s300 REAL, psi_io_s_valid INTEGER,"
+    " psi_io_f10 REAL, psi_io_f60 REAL, psi_io_f300 REAL, psi_io_f_valid INTEGER,"
+    " psi_mem_s10 REAL, psi_mem_s60 REAL, psi_mem_s300 REAL, psi_mem_s_valid INTEGER,"
+    " psi_mem_f10 REAL, psi_mem_f60 REAL, psi_mem_f300 REAL, psi_mem_f_valid INTEGER,"
+    " ctxt INTEGER, processes INTEGER, procs_running INTEGER, procs_blocked INTEGER)",
     "CREATE TABLE IF NOT EXISTS host_cpu ("
     " ts_ns INTEGER NOT NULL, cpu_idx INTEGER NOT NULL,"
     " usr INTEGER, nice INTEGER, sys INTEGER, idle INTEGER,"
     " iowait INTEGER, irq INTEGER, softirq INTEGER, steal INTEGER,"
+    " guest INTEGER, guest_nice INTEGER,"
     " PRIMARY KEY (ts_ns, cpu_idx)) WITHOUT ROWID",
     "CREATE TABLE IF NOT EXISTS host_disk ("
     " ts_ns INTEGER NOT NULL, name TEXT NOT NULL, major INTEGER, minor INTEGER,"
     " reads_completed INTEGER, writes_completed INTEGER,"
     " sectors_read INTEGER, sectors_written INTEGER,"
     " io_ticks_ms INTEGER, read_ticks_ms INTEGER, write_ticks_ms INTEGER,"
+    " reads_merged INTEGER, writes_merged INTEGER, in_flight INTEGER,"
+    " weighted_ticks_ms INTEGER, valid_mask INTEGER,"
     " PRIMARY KEY (ts_ns, name)) WITHOUT ROWID",
     "CREATE TABLE IF NOT EXISTS host_proc ("
     " ts_ns INTEGER NOT NULL, pid INTEGER NOT NULL, tgid INTEGER, state INTEGER,"
     " start_time INTEGER, utime INTEGER, stime INTEGER,"
-    " nvcsw INTEGER, nivcsw INTEGER, total_vm INTEGER, rss_kb INTEGER, comm TEXT,"
+    " nvcsw INTEGER, nivcsw INTEGER, minflt INTEGER, majflt INTEGER,"
+    " total_vm INTEGER, rss_kb INTEGER, comm TEXT,"
     " PRIMARY KEY (ts_ns, pid)) WITHOUT ROWID",
+    "CREATE TABLE IF NOT EXISTS net_stack ("
+    " ts_ns INTEGER PRIMARY KEY, netns_ino INTEGER, source TEXT, valid INTEGER, error TEXT,"
+    " active_opens INTEGER, passive_opens INTEGER, attempt_fails INTEGER, estab_resets INTEGER,"
+    " curr_estab INTEGER, in_segs INTEGER, out_segs INTEGER, retrans_segs INTEGER,"
+    " in_errs INTEGER, out_rsts INTEGER,"
+    " listen_overflows INTEGER, listen_drops INTEGER, backlog_drop INTEGER, rcv_q_drop INTEGER,"
+    " syn_retrans INTEGER, timeouts INTEGER, memory_pressures INTEGER,"
+    " udp_in_datagrams INTEGER, udp_no_ports INTEGER, udp_in_errors INTEGER,"
+    " udp_out_datagrams INTEGER, udp_rcvbuf_errors INTEGER, udp_sndbuf_errors INTEGER,"
+    " tcp_sock_mem INTEGER, udp_sock_mem INTEGER, frag_sock_mem INTEGER,"
+    " tcp_state_established INTEGER, tcp_state_syn_sent INTEGER, tcp_state_syn_recv INTEGER,"
+    " tcp_state_fin_wait1 INTEGER, tcp_state_fin_wait2 INTEGER, tcp_state_time_wait INTEGER,"
+    " tcp_state_close INTEGER, tcp_state_close_wait INTEGER, tcp_state_last_ack INTEGER,"
+    " tcp_state_listen INTEGER, tcp_state_closing INTEGER,"
+    " rqueue_bytes INTEGER, wqueue_bytes INTEGER, tcp_states_valid INTEGER)",
+    "CREATE TABLE IF NOT EXISTS net_iface ("
+    " ts_ns INTEGER NOT NULL, ifindex INTEGER NOT NULL, name TEXT,"
+    " operstate INTEGER, mtu INTEGER, source TEXT, valid INTEGER, error TEXT,"
+    " rx_bytes INTEGER, rx_packets INTEGER, rx_errors INTEGER, rx_dropped INTEGER,"
+    " tx_bytes INTEGER, tx_packets INTEGER, tx_errors INTEGER, tx_dropped INTEGER,"
+    " collisions INTEGER, carrier_changes INTEGER, rx_nohandler INTEGER,"
+    " PRIMARY KEY (ts_ns, ifindex)) WITHOUT ROWID",
+    "CREATE TABLE IF NOT EXISTS net_softnet ("
+    " ts_ns INTEGER NOT NULL, cpu_idx INTEGER NOT NULL,"
+    " processed INTEGER, dropped INTEGER, time_squeeze INTEGER,"
+    " received_rps INTEGER, flow_limit_count INTEGER, backlog_len INTEGER,"
+    " net_rx_softirq INTEGER, net_tx_softirq INTEGER,"
+    " valid INTEGER, error TEXT,"
+    " PRIMARY KEY (ts_ns, cpu_idx)) WITHOUT ROWID",
+    // ---- BASE GPU ----
+    "CREATE TABLE IF NOT EXISTS gpu_device ("
+    " ts_ns INTEGER NOT NULL, uuid TEXT NOT NULL, pci_bdf TEXT,"
+    " vendor TEXT, model TEXT, source TEXT, available INTEGER, is_mig INTEGER,"
+    " util_pct REAL, mem_util_pct REAL, mem_used_bytes INTEGER, mem_total_bytes INTEGER,"
+    " temperature_c REAL, power_w REAL, power_limit_w REAL, energy_mj INTEGER,"
+    " sm_clock_mhz INTEGER, mem_clock_mhz INTEGER,"
+    " pcie_rx_kbps INTEGER, pcie_tx_kbps INTEGER,"
+    " encoder_util_pct REAL, decoder_util_pct REAL, throttle_reasons INTEGER,"
+    " ecc_sbe_total INTEGER, ecc_dbe_total INTEGER, retired_pages INTEGER,"
+    " valid_mask INTEGER, error_code INTEGER, error_text TEXT,"
+    " PRIMARY KEY (ts_ns, uuid)) WITHOUT ROWID",
+    // ---- BASE cgroup (collector's own cgroup v2) ----
+    "CREATE TABLE IF NOT EXISTS cgroup ("
+    " ts_ns INTEGER PRIMARY KEY, available INTEGER, cgroup_path TEXT, error TEXT,"
+    " cpu_usage_usec INTEGER, user_usec INTEGER, system_usec INTEGER,"
+    " nr_periods INTEGER, nr_throttled INTEGER, throttled_usec INTEGER, cpu_valid INTEGER,"
+    " memory_current_bytes INTEGER, memory_max_bytes INTEGER, memory_max_unlimited INTEGER,"
+    " memory_events_low INTEGER, memory_events_high INTEGER, memory_events_max INTEGER,"
+    " memory_events_oom INTEGER, memory_events_oom_kill INTEGER, memory_valid INTEGER,"
+    " cpu_psi_s10 REAL, cpu_psi_s60 REAL, cpu_psi_s300 REAL, cpu_psi_s_valid INTEGER,"
+    " cpu_psi_f10 REAL, cpu_psi_f60 REAL, cpu_psi_f300 REAL, cpu_psi_f_valid INTEGER,"
+    " memory_psi_s10 REAL, memory_psi_s60 REAL, memory_psi_s300 REAL, memory_psi_s_valid INTEGER,"
+    " memory_psi_f10 REAL, memory_psi_f60 REAL, memory_psi_f300 REAL, memory_psi_f_valid INTEGER)",
+    "CREATE TABLE IF NOT EXISTS cgroup_io ("
+    " ts_ns INTEGER NOT NULL, major INTEGER NOT NULL, minor INTEGER NOT NULL,"
+    " rbytes INTEGER, wbytes INTEGER, rios INTEGER, wios INTEGER,"
+    " dbytes INTEGER, dios INTEGER,"
+    " PRIMARY KEY (ts_ns, major, minor)) WITHOUT ROWID",
     // ---- 1s anomaly feature vector ----
     "CREATE TABLE IF NOT EXISTS anomaly ("
     " ts_ns INTEGER PRIMARY KEY, seq INTEGER,"
     " on_cpu_ns_total INTEGER, switch_total INTEGER, io_ops_total INTEGER,"
-    " io_bytes_total INTEGER, faults_total INTEGER, lock_waits_total INTEGER)",
+    " io_bytes_total INTEGER, minor_faults_total INTEGER, major_faults_total INTEGER,"
+    " lock_waits_total INTEGER)",
     "CREATE TABLE IF NOT EXISTS anomaly_tid ("
     " ts_ns INTEGER NOT NULL, tid INTEGER NOT NULL, comm TEXT,"
     " on_cpu_ns INTEGER, nr_sw_vol INTEGER, nr_sw_invol INTEGER,"
@@ -199,11 +297,7 @@ const char* kDdl[] = {
     " ts_ns INTEGER NOT NULL, prog_name TEXT NOT NULL, prog_id INTEGER,"
     " run_cnt INTEGER, run_time_ns INTEGER, avg_ns REAL, interval_ns INTEGER,"
     " PRIMARY KEY (ts_ns, prog_name)) WITHOUT ROWID",
-    // ---- device IO / memory / OOM / targets / logs ----
-    "CREATE TABLE IF NOT EXISTS io_devices ("
-    " ts_ns INTEGER NOT NULL, dev INTEGER NOT NULL,"
-    " ops INTEGER, bytes INTEGER, lat_sum INTEGER,"
-    " PRIMARY KEY (ts_ns, dev)) WITHOUT ROWID",
+    // ---- memory / OOM / targets / logs ----
     "CREATE TABLE IF NOT EXISTS memory_events ("
     " ts_ns INTEGER PRIMARY KEY,"
     " kswapd_active INTEGER, direct_reclaim INTEGER, nr_reclaimed INTEGER)",
@@ -241,7 +335,7 @@ const char* kDdl[] = {
     " frames TEXT NOT NULL, value INTEGER NOT NULL)",
     "CREATE TABLE IF NOT EXISTS deep_syscall ("
     " ordinal INTEGER NOT NULL, tid INTEGER, syscall INTEGER, name TEXT,"
-    " count INTEGER, avg_us REAL, p50_us REAL, p99_us REAL)",
+    " count INTEGER, avg_us REAL, p50_us REAL, p99_us REAL, error_count INTEGER)",
     "CREATE TABLE IF NOT EXISTS deep_lock ("
     " ordinal INTEGER NOT NULL, addr TEXT, sym TEXT, count INTEGER,"
     " total_wait_ns INTEGER, avg_wait_ns INTEGER)",
@@ -250,39 +344,137 @@ const char* kDdl[] = {
     " avg_us REAL, p50_us REAL, p99_us REAL)",
     "CREATE TABLE IF NOT EXISTS deep_iofile ("
     " ordinal INTEGER NOT NULL, dev INTEGER, ino INTEGER,"
-    " path TEXT, bytes INTEGER, ops INTEGER)",
+    " path TEXT, bytes INTEGER, ops INTEGER, errors INTEGER,"
+    " lat_sum INTEGER, hist TEXT, p50_us REAL, p99_us REAL)",
+    // ---- DEEP process / io-device / network / gpu / offcpu evidence ----
+    "CREATE TABLE IF NOT EXISTS deep_proc ("
+    " ordinal INTEGER NOT NULL, ts_ns INTEGER NOT NULL, tid INTEGER NOT NULL,"
+    " tgid INTEGER, comm TEXT,"
+    " vm_rss_kb INTEGER, rss_anon_kb INTEGER, rss_file_kb INTEGER, rss_shmem_kb INTEGER,"
+    " vm_swap_kb INTEGER, status_valid INTEGER,"
+    " rchar INTEGER, wchar INTEGER, read_bytes INTEGER, write_bytes INTEGER,"
+    " syscr INTEGER, syscw INTEGER, io_valid INTEGER,"
+    " sched_exec_runtime_ns INTEGER, sched_run_delay_ns INTEGER, sched_switch_count INTEGER,"
+    " sched_valid INTEGER, available INTEGER, error TEXT,"
+    " PRIMARY KEY (ordinal, ts_ns, tid)) WITHOUT ROWID",
+    "CREATE TABLE IF NOT EXISTS deep_io_device ("
+    " ordinal INTEGER NOT NULL, dev INTEGER NOT NULL,"
+    " ops INTEGER, bytes INTEGER, lat_sum INTEGER, hist TEXT, p50_us REAL, p99_us REAL,"
+    " PRIMARY KEY (ordinal, dev)) WITHOUT ROWID",
+    "CREATE TABLE IF NOT EXISTS deep_net_flow ("
+    " ordinal INTEGER NOT NULL, cookie INTEGER NOT NULL,"
+    " tgid INTEGER, tid INTEGER, netns_ino INTEGER, family INTEGER,"
+    " local_addr INTEGER, local_port INTEGER, remote_addr INTEGER, remote_port INTEGER,"
+    " final_state INTEGER, start_ts_ns INTEGER, established_ts_ns INTEGER, end_ts_ns INTEGER,"
+    " duration_us INTEGER, connect_latency_us INTEGER, tx_bytes INTEGER, rx_bytes INTEGER,"
+    " retransmits INTEGER, rst_reason INTEGER,"
+    " rtt_count INTEGER, rtt_avg_us INTEGER, rtt_p50_us INTEGER, rtt_p99_us INTEGER,"
+    " closed INTEGER, owner_available INTEGER, error TEXT,"
+    " PRIMARY KEY (ordinal, cookie)) WITHOUT ROWID",
+    "CREATE TABLE IF NOT EXISTS deep_net_drop ("
+    " ordinal INTEGER NOT NULL, netns_ino INTEGER NOT NULL, ifindex INTEGER NOT NULL,"
+    " reason_id INTEGER NOT NULL, reason TEXT, count INTEGER,"
+    " PRIMARY KEY (ordinal, netns_ino, ifindex, reason_id)) WITHOUT ROWID",
+    "CREATE TABLE IF NOT EXISTS deep_net_softirq ("
+    " ordinal INTEGER NOT NULL, cpu_idx INTEGER NOT NULL, vector INTEGER NOT NULL,"
+    " vector_name TEXT, count INTEGER, time_ns INTEGER, hist TEXT,"
+    " PRIMARY KEY (ordinal, cpu_idx, vector)) WITHOUT ROWID",
+    "CREATE TABLE IF NOT EXISTS deep_gpu_process ("
+    " ordinal INTEGER NOT NULL, ts_ns INTEGER NOT NULL, gpu_uuid TEXT NOT NULL,"
+    " pid INTEGER NOT NULL, tgid INTEGER, comm TEXT, source TEXT,"
+    " sm_util_pct REAL, mem_util_pct REAL, enc_util_pct REAL, dec_util_pct REAL,"
+    " fb_used_bytes INTEGER, source_ts_us INTEGER, valid_mask INTEGER, error TEXT,"
+    " PRIMARY KEY (ordinal, ts_ns, gpu_uuid, pid)) WITHOUT ROWID",
+    "CREATE TABLE IF NOT EXISTS deep_offcpu ("
+    " ordinal INTEGER NOT NULL, tid INTEGER NOT NULL,"
+    " tgid INTEGER, comm TEXT, dwell_ns INTEGER, count INTEGER, stack_available INTEGER,"
+    " PRIMARY KEY (ordinal, tid)) WITHOUT ROWID",
     "CREATE INDEX IF NOT EXISTS idx_deep_folded ON deep_folded(ordinal, kind)",
 };
 
 // Immutable statement SQL table; indexed by Stmt. Entries are positional and
-// MUST match the Stmt enum order above (C++20 has no array-designator
-// initializers).
+// MUST match the Stmt enum order above.
 const char* const kSql[] = {
     // S_META_INS
     "INSERT INTO meta(key,value) VALUES(?,?)",
     // S_HOST_INS
-    "INSERT INTO host (ts_ns,cu_user,cu_nice,cu_sys,cu_idle,cu_iowait,"
-    "cu_irq,cu_softirq,cu_steal,load1,load5,load15,nr_running,nr_threads,"
-    "mem_total_kb,mem_avail_kb,mem_free_kb,buffers_kb,cached_kb,"
-    "swap_total_kb,swap_free_kb,anon_pages_kb,vm_pgfault,vm_pgmajfault,"
-    "vm_pswpin,vm_pswpout,vm_free_pages,vm_anon_pages,psi_cpu10,psi_cpu60,"
-    "psi_cpu300,psi_io10,psi_io60,psi_io300,psi_mem10,psi_mem60,psi_mem300) "
-    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
-    "?,?,?,?,?,?,?,?,?)",
     // S_HOST_CPU_INS
-    "INSERT INTO host_cpu (ts_ns,cpu_idx,usr,nice,sys,idle,iowait,irq,softirq,steal) "
-    "VALUES(?,?,?,?,?,?,?,?,?,?)",
+    "INSERT INTO host (ts_ns,cu_user,cu_nice,cu_sys,cu_idle,cu_iowait,"
+    "cu_irq,cu_softirq,cu_steal,cu_guest,cu_guest_nice,"
+    "load1,load5,load15,nr_running,nr_threads,"
+    "mem_total_kb,mem_avail_kb,mem_free_kb,buffers_kb,cached_kb,"
+    "swap_total_kb,swap_free_kb,anon_pages_kb,sreclaimable_kb,shmem_kb,dirty_kb,"
+    "writeback_kb,commit_limit_kb,committed_as_kb,mem_valid_mask,"
+    "vm_pgfault,vm_pgmajfault,vm_pswpin,vm_pswpout,vm_pgscan_kswapd,"
+    "vm_pgscan_direct,vm_pgsteal_kswapd,vm_pgsteal_direct,vm_workingset_refault,"
+    "vm_nr_dirty,vm_nr_writeback,vm_valid_mask,"
+    "psi_cpu_s10,psi_cpu_s60,psi_cpu_s300,psi_cpu_s_valid,"
+    "psi_cpu_f10,psi_cpu_f60,psi_cpu_f300,psi_cpu_f_valid,"
+    "psi_io_s10,psi_io_s60,psi_io_s300,psi_io_s_valid,"
+    "psi_io_f10,psi_io_f60,psi_io_f300,psi_io_f_valid,"
+    "psi_mem_s10,psi_mem_s60,psi_mem_s300,psi_mem_s_valid,"
+    "psi_mem_f10,psi_mem_f60,psi_mem_f300,psi_mem_f_valid,"
+    "ctxt,processes,procs_running,procs_blocked) "
+    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
+    "?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    "INSERT INTO host_cpu (ts_ns,cpu_idx,usr,nice,sys,idle,iowait,irq,softirq,steal,"
+    "guest,guest_nice) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
     // S_HOST_DISK_INS
     "INSERT INTO host_disk (ts_ns,name,major,minor,reads_completed,"
     "writes_completed,sectors_read,sectors_written,io_ticks_ms,"
-    "read_ticks_ms,write_ticks_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+    "read_ticks_ms,write_ticks_ms,reads_merged,writes_merged,in_flight,"
+    "weighted_ticks_ms,valid_mask) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
     // S_HOST_PROC_INS
     "INSERT INTO host_proc (ts_ns,pid,tgid,state,start_time,utime,stime,"
-    "nvcsw,nivcsw,total_vm,rss_kb,comm) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+    "nvcsw,nivcsw,minflt,majflt,total_vm,rss_kb,comm) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    // S_NET_STACK_INS
+    "INSERT INTO net_stack (ts_ns,netns_ino,source,valid,error,"
+    "active_opens,passive_opens,attempt_fails,estab_resets,curr_estab,"
+    "in_segs,out_segs,retrans_segs,in_errs,out_rsts,"
+    "listen_overflows,listen_drops,backlog_drop,rcv_q_drop,syn_retrans,"
+    "timeouts,memory_pressures,udp_in_datagrams,udp_no_ports,udp_in_errors,"
+    "udp_out_datagrams,udp_rcvbuf_errors,udp_sndbuf_errors,"
+    "tcp_sock_mem,udp_sock_mem,frag_sock_mem,"
+    "tcp_state_established,tcp_state_syn_sent,tcp_state_syn_recv,"
+    "tcp_state_fin_wait1,tcp_state_fin_wait2,tcp_state_time_wait,"
+    "tcp_state_close,tcp_state_close_wait,tcp_state_last_ack,"
+    "tcp_state_listen,tcp_state_closing,rqueue_bytes,wqueue_bytes,tcp_states_valid) "
+    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
+    "?,?,?,?,?,?,?,?,?,?,?)",
+    // S_NET_IFACE_INS
+    "INSERT INTO net_iface (ts_ns,ifindex,name,operstate,mtu,source,valid,error,"
+    "rx_bytes,rx_packets,rx_errors,rx_dropped,"
+    "tx_bytes,tx_packets,tx_errors,tx_dropped,"
+    "collisions,carrier_changes,rx_nohandler) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    // S_NET_SOFTNET_INS
+    "INSERT INTO net_softnet (ts_ns,cpu_idx,processed,dropped,time_squeeze,"
+    "received_rps,flow_limit_count,backlog_len,net_rx_softirq,net_tx_softirq,"
+    "valid,error) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+    // S_GPU_DEV_INS
+    "INSERT INTO gpu_device (ts_ns,uuid,pci_bdf,vendor,model,source,available,is_mig,"
+    "util_pct,mem_util_pct,mem_used_bytes,mem_total_bytes,temperature_c,power_w,"
+    "power_limit_w,energy_mj,sm_clock_mhz,mem_clock_mhz,pcie_rx_kbps,pcie_tx_kbps,"
+    "encoder_util_pct,decoder_util_pct,throttle_reasons,ecc_sbe_total,ecc_dbe_total,"
+    "retired_pages,valid_mask,error_code,error_text) "
+    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    // S_CGROUP_INS
+    "INSERT INTO cgroup (ts_ns,available,cgroup_path,error,"
+    "cpu_usage_usec,user_usec,system_usec,nr_periods,nr_throttled,throttled_usec,cpu_valid,"
+    "memory_current_bytes,memory_max_bytes,memory_max_unlimited,"
+    "memory_events_low,memory_events_high,memory_events_max,"
+    "memory_events_oom,memory_events_oom_kill,memory_valid,"
+    "cpu_psi_s10,cpu_psi_s60,cpu_psi_s300,cpu_psi_s_valid,"
+    "cpu_psi_f10,cpu_psi_f60,cpu_psi_f300,cpu_psi_f_valid,"
+    "memory_psi_s10,memory_psi_s60,memory_psi_s300,memory_psi_s_valid,"
+    "memory_psi_f10,memory_psi_f60,memory_psi_f300,memory_psi_f_valid) "
+    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    // S_CGROUP_IO_INS
+    "INSERT INTO cgroup_io (ts_ns,major,minor,rbytes,wbytes,rios,wios,dbytes,dios) "
+    "VALUES(?,?,?,?,?,?,?,?,?)",
     // S_ANOMALY_INS
     "INSERT INTO anomaly (ts_ns,seq,on_cpu_ns_total,switch_total,"
-    "io_ops_total,io_bytes_total,faults_total,lock_waits_total) "
-    "VALUES(?,?,?,?,?,?,?,?)",
+    "io_ops_total,io_bytes_total,minor_faults_total,major_faults_total,"
+    "lock_waits_total) VALUES(?,?,?,?,?,?,?,?,?)",
     // S_ANOMALY_TID_INS
     "INSERT INTO anomaly_tid (ts_ns,tid,comm,on_cpu_ns,nr_sw_vol,"
     "nr_sw_invol,io_ops,io_bytes,pf_minor,pf_major,lock_waits,"
@@ -295,8 +487,6 @@ const char* const kSql[] = {
     // S_MEMEV_INS
     "INSERT INTO memory_events (ts_ns,kswapd_active,direct_reclaim,"
     "nr_reclaimed) VALUES(?,?,?,?)",
-    // S_IODEV_INS
-    "INSERT INTO io_devices (ts_ns,dev,ops,bytes,lat_sum) VALUES(?,?,?,?,?)",
     // S_BPF_INS
     "INSERT INTO bpf_stats (ts_ns,prog_name,prog_id,run_cnt,run_time_ns,"
     "avg_ns,interval_ns) VALUES(?,?,?,?,?,?,?)",
@@ -325,7 +515,7 @@ const char* const kSql[] = {
     "INSERT INTO deep_folded (ordinal,kind,frames,value) VALUES(?,?,?,?)",
     // S_SYSCALL_INS
     "INSERT INTO deep_syscall (ordinal,tid,syscall,name,count,avg_us,p50_us,"
-    "p99_us) VALUES(?,?,?,?,?,?,?,?)",
+    "p99_us,error_count) VALUES(?,?,?,?,?,?,?,?,?)",
     // S_LOCK_INS
     "INSERT INTO deep_lock (ordinal,addr,sym,count,total_wait_ns,avg_wait_ns) "
     "VALUES(?,?,?,?,?,?)",
@@ -333,7 +523,37 @@ const char* const kSql[] = {
     "INSERT INTO deep_runq (ordinal,tid,count,avg_us,p50_us,p99_us) "
     "VALUES(?,?,?,?,?,?)",
     // S_IOFILE_INS
-    "INSERT INTO deep_iofile (ordinal,dev,ino,path,bytes,ops) VALUES(?,?,?,?,?,?)",
+    "INSERT INTO deep_iofile (ordinal,dev,ino,path,bytes,ops,errors,lat_sum,hist,"
+    "p50_us,p99_us) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+    // S_DEEP_PROC_INS
+    "INSERT INTO deep_proc (ordinal,ts_ns,tid,tgid,comm,"
+    "vm_rss_kb,rss_anon_kb,rss_file_kb,rss_shmem_kb,vm_swap_kb,status_valid,"
+    "rchar,wchar,read_bytes,write_bytes,syscr,syscw,io_valid,"
+    "sched_exec_runtime_ns,sched_run_delay_ns,sched_switch_count,sched_valid,"
+    "available,error) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    // S_DEEP_IODEV_INS
+    "INSERT INTO deep_io_device (ordinal,dev,ops,bytes,lat_sum,hist,p50_us,p99_us) "
+    "VALUES(?,?,?,?,?,?,?,?)",
+    // S_NET_FLOW_INS
+    "INSERT INTO deep_net_flow (ordinal,cookie,tgid,tid,netns_ino,family,"
+    "local_addr,local_port,remote_addr,remote_port,final_state,"
+    "start_ts_ns,established_ts_ns,end_ts_ns,duration_us,connect_latency_us,"
+    "tx_bytes,rx_bytes,retransmits,rst_reason,"
+    "rtt_count,rtt_avg_us,rtt_p50_us,rtt_p99_us,closed,owner_available,error) "
+    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    // S_NET_DROP_INS
+    "INSERT INTO deep_net_drop (ordinal,netns_ino,ifindex,reason_id,reason,count) "
+    "VALUES(?,?,?,?,?,?)",
+    // S_NET_SOFTIRQ_INS
+    "INSERT INTO deep_net_softirq (ordinal,cpu_idx,vector,vector_name,count,time_ns,hist) "
+    "VALUES(?,?,?,?,?,?,?)",
+    // S_DEEP_GPU_PROC_INS
+    "INSERT INTO deep_gpu_process (ordinal,ts_ns,gpu_uuid,pid,tgid,comm,source,"
+    "sm_util_pct,mem_util_pct,enc_util_pct,dec_util_pct,fb_used_bytes,source_ts_us,"
+    "valid_mask,error) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    // S_OFFCPU_INS
+    "INSERT INTO deep_offcpu (ordinal,tid,tgid,comm,dwell_ns,count,stack_available) "
+    "VALUES(?,?,?,?,?,?,?)",
     // S_TID_COMM_LOOKUP
     "SELECT comm FROM targets_log WHERE tid=? ORDER BY seq DESC LIMIT 1",
 };
@@ -400,7 +620,7 @@ bool OutputWriter::Init(const Config& cfg) {
   sqlite3_busy_timeout(db_, 2000);
 
   if (!Exec("PRAGMA journal_mode=WAL") || !Exec("PRAGMA synchronous=NORMAL") ||
-      !Exec("PRAGMA temp_store=MEMORY") || !Exec("PRAGMA user_version=1")) {
+      !Exec("PRAGMA temp_store=MEMORY") || !Exec("PRAGMA user_version=2")) {
     sqlite3_close(db_);
     db_ = nullptr;
     return false;
@@ -429,7 +649,7 @@ bool OutputWriter::Init(const Config& cfg) {
       std::string iso = NowIso();
       std::string pid = std::to_string(getpid());
       struct { const char* k; const char* v; } rows[3] = {
-          {"schema_version", "1"},
+          {"schema_version", "2"},
           {"created_wall", iso.c_str()},
           {"collector_pid", pid.c_str()},
       };
@@ -470,57 +690,95 @@ void OutputWriter::Close() {
 // ---------------------------------------------------------------------------
 // BASE
 // ---------------------------------------------------------------------------
-void OutputWriter::WriteHostRow(const HostSnapshot& s) {
+void OutputWriter::WriteHostRow(const HostSnapshot& s, const NetworkSnapshot& net,
+                                const GpuSnapshot& gpu, const CgroupSnapshot& cg) {
   if (!db_) return;
   sqlite3_stmt* st = Prep(S_HOST_INS);
-  if (!st) return;
-  sqlite3_reset(st);
-  int c = 1;
-  sqlite3_bind_int64(st, c++, (sqlite3_int64)s.ts_ns);
-  sqlite3_bind_int64(st, c++, s.total.user);
-  sqlite3_bind_int64(st, c++, s.total.nice);
-  sqlite3_bind_int64(st, c++, s.total.system);
-  sqlite3_bind_int64(st, c++, s.total.idle);
-  sqlite3_bind_int64(st, c++, s.total.iowait);
-  sqlite3_bind_int64(st, c++, s.total.irq);
-  sqlite3_bind_int64(st, c++, s.total.softirq);
-  sqlite3_bind_int64(st, c++, s.total.steal);
-  sqlite3_bind_double(st, c++, s.load.load1);
-  sqlite3_bind_double(st, c++, s.load.load5);
-  sqlite3_bind_double(st, c++, s.load.load15);
-  sqlite3_bind_int64(st, c++, s.load.nr_running);
-  sqlite3_bind_int64(st, c++, s.load.nr_threads);
-  sqlite3_bind_int64(st, c++, s.mem.mem_total_kb);
-  sqlite3_bind_int64(st, c++, s.mem.mem_available_kb);
-  sqlite3_bind_int64(st, c++, s.mem.mem_free_kb);
-  sqlite3_bind_int64(st, c++, s.mem.buffers_kb);
-  sqlite3_bind_int64(st, c++, s.mem.cached_kb);
-  sqlite3_bind_int64(st, c++, s.mem.swap_total_kb);
-  sqlite3_bind_int64(st, c++, s.mem.swap_free_kb);
-  sqlite3_bind_int64(st, c++, s.mem.anon_pages_kb);
-  sqlite3_bind_int64(st, c++, s.vm.pgfault);
-  sqlite3_bind_int64(st, c++, s.vm.pgmajfault);
-  sqlite3_bind_int64(st, c++, s.vm.pswpin);
-  sqlite3_bind_int64(st, c++, s.vm.pswpout);
-  sqlite3_bind_int64(st, c++, s.vm.nr_free_pages);
-  sqlite3_bind_int64(st, c++, s.vm.nr_anon_pages);
-  sqlite3_bind_double(st, c++, s.psi.cpu10);
-  sqlite3_bind_double(st, c++, s.psi.cpu60);
-  sqlite3_bind_double(st, c++, s.psi.cpu300);
-  sqlite3_bind_double(st, c++, s.psi.io10);
-  sqlite3_bind_double(st, c++, s.psi.io60);
-  sqlite3_bind_double(st, c++, s.psi.io300);
-  sqlite3_bind_double(st, c++, s.psi.mem10);
-  sqlite3_bind_double(st, c++, s.psi.mem60);
-  sqlite3_bind_double(st, c++, s.psi.mem300);
-  Step(S_HOST_INS, "host");
+  if (st) {
+    sqlite3_reset(st);
+    int c = 1;
+    const uint32_t mv = s.mem.valid_mask;
+    const uint32_t vv = s.vm.valid_mask;
+    sqlite3_bind_int64(st, c++, (sqlite3_int64)s.ts_ns);
+    sqlite3_bind_int64(st, c++, s.total.user);
+    sqlite3_bind_int64(st, c++, s.total.nice);
+    sqlite3_bind_int64(st, c++, s.total.system);
+    sqlite3_bind_int64(st, c++, s.total.idle);
+    sqlite3_bind_int64(st, c++, s.total.iowait);
+    sqlite3_bind_int64(st, c++, s.total.irq);
+    sqlite3_bind_int64(st, c++, s.total.softirq);
+    sqlite3_bind_int64(st, c++, s.total.steal);
+    sqlite3_bind_int64(st, c++, s.total.guest);
+    sqlite3_bind_int64(st, c++, s.total.guest_nice);
+    sqlite3_bind_double(st, c++, s.load.load1);
+    sqlite3_bind_double(st, c++, s.load.load5);
+    sqlite3_bind_double(st, c++, s.load.load15);
+    sqlite3_bind_int64(st, c++, s.load.nr_running);
+    sqlite3_bind_int64(st, c++, s.load.nr_threads);
+    BindU64(st, c, s.mem.mem_total_kb, mv & (1u << 0));
+    BindU64(st, c, s.mem.mem_available_kb, mv & (1u << 1));
+    BindU64(st, c, s.mem.mem_free_kb, mv & (1u << 2));
+    BindU64(st, c, s.mem.buffers_kb, mv & (1u << 3));
+    BindU64(st, c, s.mem.cached_kb, mv & (1u << 4));
+    BindU64(st, c, s.mem.swap_total_kb, mv & (1u << 5));
+    BindU64(st, c, s.mem.swap_free_kb, mv & (1u << 6));
+    BindU64(st, c, s.mem.anon_pages_kb, mv & (1u << 7));
+    BindU64(st, c, s.mem.sreclaimable_kb, mv & (1u << 8));
+    BindU64(st, c, s.mem.shmem_kb, mv & (1u << 9));
+    BindU64(st, c, s.mem.dirty_kb, mv & (1u << 10));
+    BindU64(st, c, s.mem.writeback_kb, mv & (1u << 11));
+    BindU64(st, c, s.mem.commit_limit_kb, mv & (1u << 12));
+    BindU64(st, c, s.mem.committed_as_kb, mv & (1u << 13));
+    sqlite3_bind_int64(st, c++, (sqlite3_int64)mv);
+    BindU64(st, c, s.vm.pgfault, vv & (1u << 0));
+    BindU64(st, c, s.vm.pgmajfault, vv & (1u << 1));
+    BindU64(st, c, s.vm.pswpin, vv & (1u << 2));
+    BindU64(st, c, s.vm.pswpout, vv & (1u << 3));
+    BindU64(st, c, s.vm.pgscan_kswapd, vv & (1u << 4));
+    BindU64(st, c, s.vm.pgscan_direct, vv & (1u << 5));
+    BindU64(st, c, s.vm.pgsteal_kswapd, vv & (1u << 6));
+    BindU64(st, c, s.vm.pgsteal_direct, vv & (1u << 7));
+    BindU64(st, c, s.vm.workingset_refault, vv & (1u << 8));
+    BindU64(st, c, s.vm.nr_dirty, vv & (1u << 9));
+    BindU64(st, c, s.vm.nr_writeback, vv & (1u << 10));
+    sqlite3_bind_int64(st, c++, (sqlite3_int64)vv);
+    const PsiWindow* psis[3] = {&s.psi.cpu, &s.psi.io, &s.psi.memory};
+    for (int k = 0; k < 3; ++k) {
+      const PsiWindow& p = *psis[k];
+      if (p.some_valid) {
+        sqlite3_bind_double(st, c++, p.avg10);
+        sqlite3_bind_double(st, c++, p.avg60);
+        sqlite3_bind_double(st, c++, p.avg300);
+      } else {
+        sqlite3_bind_null(st, c++);
+        sqlite3_bind_null(st, c++);
+        sqlite3_bind_null(st, c++);
+      }
+      BindBool(st, c, p.some_valid);
+      if (p.full_valid) {
+        sqlite3_bind_double(st, c++, p.avg10);
+        sqlite3_bind_double(st, c++, p.avg60);
+        sqlite3_bind_double(st, c++, p.avg300);
+      } else {
+        sqlite3_bind_null(st, c++);
+        sqlite3_bind_null(st, c++);
+        sqlite3_bind_null(st, c++);
+      }
+      BindBool(st, c, p.full_valid);
+    }
+    sqlite3_bind_int64(st, c++, (sqlite3_int64)s.ctxt);
+    sqlite3_bind_int64(st, c++, (sqlite3_int64)s.processes);
+    sqlite3_bind_int64(st, c++, (sqlite3_int64)s.procs_running);
+    sqlite3_bind_int64(st, c++, (sqlite3_int64)s.procs_blocked);
+    Step(S_HOST_INS, "host");
+  }
 
   size_t ci = 0;
   for (const auto& cpu : s.cpus) {
     st = Prep(S_HOST_CPU_INS);
     if (!st) return;
     sqlite3_reset(st);
-    c = 1;
+    int c = 1;
     sqlite3_bind_int64(st, c++, (sqlite3_int64)s.ts_ns);
     sqlite3_bind_int64(st, c++, (sqlite3_int64)ci);
     sqlite3_bind_int64(st, c++, cpu.user);
@@ -531,6 +789,8 @@ void OutputWriter::WriteHostRow(const HostSnapshot& s) {
     sqlite3_bind_int64(st, c++, cpu.irq);
     sqlite3_bind_int64(st, c++, cpu.softirq);
     sqlite3_bind_int64(st, c++, cpu.steal);
+    sqlite3_bind_int64(st, c++, cpu.guest);
+    sqlite3_bind_int64(st, c++, cpu.guest_nice);
     Step(S_HOST_CPU_INS, "host_cpu");
     ++ci;
   }
@@ -539,18 +799,23 @@ void OutputWriter::WriteHostRow(const HostSnapshot& s) {
     st = Prep(S_HOST_DISK_INS);
     if (!st) return;
     sqlite3_reset(st);
-    c = 1;
+    int c = 1;
+    const uint32_t dv = d.valid_mask;
     sqlite3_bind_int64(st, c++, (sqlite3_int64)s.ts_ns);
     sqlite3_bind_text(st, c++, d.name, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(st, c++, d.major);
     sqlite3_bind_int64(st, c++, d.minor);
-    sqlite3_bind_int64(st, c++, d.reads_completed);
-    sqlite3_bind_int64(st, c++, d.writes_completed);
-    sqlite3_bind_int64(st, c++, d.sectors_read);
-    sqlite3_bind_int64(st, c++, d.sectors_written);
-    sqlite3_bind_int64(st, c++, d.io_ticks_ms);
-    sqlite3_bind_int64(st, c++, d.read_ticks_ms);
-    sqlite3_bind_int64(st, c++, d.write_ticks_ms);
+    BindU64(st, c, d.reads_completed, dv & (1u << 0));
+    BindU64(st, c, d.writes_completed, dv & (1u << 4));
+    BindU64(st, c, d.sectors_read, dv & (1u << 2));
+    BindU64(st, c, d.sectors_written, dv & (1u << 6));
+    BindU64(st, c, d.read_ticks_ms, dv & (1u << 3));
+    BindU64(st, c, d.write_ticks_ms, dv & (1u << 7));
+    BindU64(st, c, d.reads_merged, dv & (1u << 1));
+    BindU64(st, c, d.writes_merged, dv & (1u << 5));
+    BindU64(st, c, d.ios_in_flight, dv & (1u << 8));
+    BindU64(st, c, d.weighted_ticks_ms, dv & (1u << 10));
+    sqlite3_bind_int64(st, c++, (sqlite3_int64)dv);
     Step(S_HOST_DISK_INS, "host_disk");
   }
 
@@ -558,7 +823,7 @@ void OutputWriter::WriteHostRow(const HostSnapshot& s) {
     st = Prep(S_HOST_PROC_INS);
     if (!st) return;
     sqlite3_reset(st);
-    c = 1;
+    int c = 1;
     sqlite3_bind_int64(st, c++, (sqlite3_int64)s.ts_ns);
     sqlite3_bind_int64(st, c++, p.pid);
     sqlite3_bind_int64(st, c++, p.tgid);
@@ -568,10 +833,239 @@ void OutputWriter::WriteHostRow(const HostSnapshot& s) {
     sqlite3_bind_int64(st, c++, p.stime);
     sqlite3_bind_int64(st, c++, p.nvcsw);
     sqlite3_bind_int64(st, c++, p.nivcsw);
+    sqlite3_bind_int64(st, c++, p.minflt);
+    sqlite3_bind_int64(st, c++, p.majflt);
     sqlite3_bind_int64(st, c++, p.total_vm);
-    sqlite3_bind_int64(st, c++, p.rss_kb);
+    if (p.rss_valid)
+      sqlite3_bind_int64(st, c++, (sqlite3_int64)p.rss_kb);
+    else
+      sqlite3_bind_null(st, c++);
     sqlite3_bind_text(st, c++, p.comm, -1, SQLITE_TRANSIENT);
     Step(S_HOST_PROC_INS, "host_proc");
+  }
+
+  // network: one net_stack row + per-iface/per-cpu rows
+  {
+    const auto& t = net.stack;
+    st = Prep(S_NET_STACK_INS);
+    if (st) {
+      sqlite3_reset(st);
+      int c = 1;
+      sqlite3_bind_int64(st, c++, (sqlite3_int64)net.ts_ns);
+      sqlite3_bind_int64(st, c++, (sqlite3_int64)t.netns_ino);
+      BindText(st, c, t.source);
+      BindBool(st, c, t.valid);
+      BindText(st, c, t.error);
+      sqlite3_bind_int64(st, c++, (sqlite3_int64)t.active_opens);
+      sqlite3_bind_int64(st, c++, (sqlite3_int64)t.passive_opens);
+      sqlite3_bind_int64(st, c++, (sqlite3_int64)t.attempt_fails);
+      sqlite3_bind_int64(st, c++, (sqlite3_int64)t.estab_resets);
+      sqlite3_bind_int64(st, c++, (sqlite3_int64)t.curr_estab);
+      sqlite3_bind_int64(st, c++, (sqlite3_int64)t.in_segs);
+      sqlite3_bind_int64(st, c++, (sqlite3_int64)t.out_segs);
+      sqlite3_bind_int64(st, c++, (sqlite3_int64)t.retrans_segs);
+      sqlite3_bind_int64(st, c++, (sqlite3_int64)t.in_errs);
+      sqlite3_bind_int64(st, c++, (sqlite3_int64)t.out_rsts);
+      sqlite3_bind_int64(st, c++, (sqlite3_int64)t.listen_overflows);
+      sqlite3_bind_int64(st, c++, (sqlite3_int64)t.listen_drops);
+      sqlite3_bind_int64(st, c++, (sqlite3_int64)t.backlog_drop);
+      sqlite3_bind_int64(st, c++, (sqlite3_int64)t.rcv_q_drop);
+      sqlite3_bind_int64(st, c++, (sqlite3_int64)t.syn_retrans);
+      sqlite3_bind_int64(st, c++, (sqlite3_int64)t.timeouts);
+      sqlite3_bind_int64(st, c++, (sqlite3_int64)t.memory_pressures);
+      sqlite3_bind_int64(st, c++, (sqlite3_int64)t.udp_in_datagrams);
+      sqlite3_bind_int64(st, c++, (sqlite3_int64)t.udp_no_ports);
+      sqlite3_bind_int64(st, c++, (sqlite3_int64)t.udp_in_errors);
+      sqlite3_bind_int64(st, c++, (sqlite3_int64)t.udp_out_datagrams);
+      sqlite3_bind_int64(st, c++, (sqlite3_int64)t.udp_rcvbuf_errors);
+      sqlite3_bind_int64(st, c++, (sqlite3_int64)t.udp_sndbuf_errors);
+      sqlite3_bind_int64(st, c++, (sqlite3_int64)t.tcp_sock_mem);
+      sqlite3_bind_int64(st, c++, (sqlite3_int64)t.udp_sock_mem);
+      sqlite3_bind_int64(st, c++, (sqlite3_int64)t.frag_sock_mem);
+      auto bind_state = [&](uint64_t v) {
+        if (t.tcp_states_valid)
+          sqlite3_bind_int64(st, c++, (sqlite3_int64)v);
+        else
+          sqlite3_bind_null(st, c++);
+      };
+      bind_state(t.tcp_state_established);
+      bind_state(t.tcp_state_syn_sent);
+      bind_state(t.tcp_state_syn_recv);
+      bind_state(t.tcp_state_fin_wait1);
+      bind_state(t.tcp_state_fin_wait2);
+      bind_state(t.tcp_state_time_wait);
+      bind_state(t.tcp_state_close);
+      bind_state(t.tcp_state_close_wait);
+      bind_state(t.tcp_state_last_ack);
+      bind_state(t.tcp_state_listen);
+      bind_state(t.tcp_state_closing);
+      bind_state(t.rqueue_bytes);
+      bind_state(t.wqueue_bytes);
+      BindBool(st, c, t.tcp_states_valid);
+      Step(S_NET_STACK_INS, "net_stack");
+    }
+  }
+  for (const auto& i : net.ifaces) {
+    st = Prep(S_NET_IFACE_INS);
+    if (!st) return;
+    sqlite3_reset(st);
+    int c = 1;
+    sqlite3_bind_int64(st, c++, (sqlite3_int64)net.ts_ns);
+    sqlite3_bind_int64(st, c++, i.ifindex);
+    BindText(st, c, i.name);
+    if (i.operstate >= 0)
+      sqlite3_bind_int(st, c++, i.operstate);
+    else
+      sqlite3_bind_null(st, c++);
+    sqlite3_bind_int64(st, c++, i.mtu);
+    BindText(st, c, "netlink");
+    BindBool(st, c, i.valid);
+    BindText(st, c, i.error);
+    sqlite3_bind_int64(st, c++, (sqlite3_int64)i.rx_bytes);
+    sqlite3_bind_int64(st, c++, (sqlite3_int64)i.rx_packets);
+    sqlite3_bind_int64(st, c++, (sqlite3_int64)i.rx_errors);
+    sqlite3_bind_int64(st, c++, (sqlite3_int64)i.rx_dropped);
+    sqlite3_bind_int64(st, c++, (sqlite3_int64)i.tx_bytes);
+    sqlite3_bind_int64(st, c++, (sqlite3_int64)i.tx_packets);
+    sqlite3_bind_int64(st, c++, (sqlite3_int64)i.tx_errors);
+    sqlite3_bind_int64(st, c++, (sqlite3_int64)i.tx_dropped);
+    sqlite3_bind_int64(st, c++, (sqlite3_int64)i.collisions);
+    sqlite3_bind_int64(st, c++, (sqlite3_int64)i.carrier_changes);
+    sqlite3_bind_int64(st, c++, (sqlite3_int64)i.rx_nohandler);
+    Step(S_NET_IFACE_INS, "net_iface");
+  }
+  for (const auto& n : net.softnets) {
+    st = Prep(S_NET_SOFTNET_INS);
+    if (!st) return;
+    sqlite3_reset(st);
+    int c = 1;
+    sqlite3_bind_int64(st, c++, (sqlite3_int64)net.ts_ns);
+    sqlite3_bind_int64(st, c++, n.cpu_idx);
+    sqlite3_bind_int64(st, c++, (sqlite3_int64)n.processed);
+    sqlite3_bind_int64(st, c++, (sqlite3_int64)n.dropped);
+    sqlite3_bind_int64(st, c++, (sqlite3_int64)n.time_squeeze);
+    sqlite3_bind_int64(st, c++, (sqlite3_int64)n.received_rps);
+    sqlite3_bind_int64(st, c++, (sqlite3_int64)n.flow_limit_count);
+    sqlite3_bind_int64(st, c++, (sqlite3_int64)n.backlog_len);
+    sqlite3_bind_int64(st, c++, (sqlite3_int64)n.net_rx_softirq);
+    sqlite3_bind_int64(st, c++, (sqlite3_int64)n.net_tx_softirq);
+    BindBool(st, c, n.valid);
+    BindText(st, c, n.error);
+    Step(S_NET_SOFTNET_INS, "net_softnet");
+  }
+
+  // GPU: one row per device per tick (disabled/unavailable devices included).
+  for (const auto& d : gpu.devices) {
+    st = Prep(S_GPU_DEV_INS);
+    if (!st) return;
+    sqlite3_reset(st);
+    int c = 1;
+    sqlite3_bind_int64(st, c++, (sqlite3_int64)gpu.ts_ns);
+    BindText(st, c, d.uuid);
+    BindText(st, c, d.pci_bdf);
+    BindText(st, c, d.vendor);
+    BindText(st, c, d.model);
+    BindText(st, c, d.source);
+    BindBool(st, c, d.available);
+    BindBool(st, c, d.is_mig);
+    sqlite3_bind_double(st, c++, d.util_pct);
+    sqlite3_bind_double(st, c++, d.mem_util_pct);
+    BindU64(st, c, d.mem_used_bytes, d.valid_mask & (1u << 2));
+    BindU64(st, c, d.mem_total_bytes, d.valid_mask & (1u << 3));
+    sqlite3_bind_double(st, c++, d.temperature_c);
+    sqlite3_bind_double(st, c++, d.power_w);
+    sqlite3_bind_double(st, c++, d.power_limit_w);
+    BindU64(st, c, d.energy_mj, d.valid_mask & (1u << 7));
+    sqlite3_bind_int(st, c++, (int)d.sm_clock_mhz);
+    sqlite3_bind_int(st, c++, (int)d.mem_clock_mhz);
+    BindU64(st, c, d.pcie_rx_kbps, d.valid_mask & (1u << 10));
+    BindU64(st, c, d.pcie_tx_kbps, d.valid_mask & (1u << 11));
+    sqlite3_bind_double(st, c++, d.encoder_util_pct);
+    sqlite3_bind_double(st, c++, d.decoder_util_pct);
+    sqlite3_bind_int64(st, c++, (sqlite3_int64)d.throttle_reasons);
+    BindU64(st, c, d.ecc_sbe_total, d.valid_mask & (1u << 15));
+    BindU64(st, c, d.ecc_dbe_total, d.valid_mask & (1u << 16));
+    BindU64(st, c, d.retired_pages, d.valid_mask & (1u << 17));
+    sqlite3_bind_int64(st, c++, (sqlite3_int64)d.valid_mask);
+    sqlite3_bind_int(st, c++, (int)d.error_code);
+    BindText(st, c, d.error_text);
+    Step(S_GPU_DEV_INS, "gpu_device");
+  }
+
+  // cgroup
+  {
+    st = Prep(S_CGROUP_INS);
+    if (st) {
+      sqlite3_reset(st);
+      int c = 1;
+      sqlite3_bind_int64(st, c++, (sqlite3_int64)cg.ts_ns);
+      BindBool(st, c, cg.available);
+      BindText(st, c, cg.cgroup_path);
+      BindText(st, c, cg.error);
+      BindU64(st, c, cg.cpu_usage_usec, cg.cpu_valid);
+      BindU64(st, c, cg.user_usec, cg.cpu_valid);
+      BindU64(st, c, cg.system_usec, cg.cpu_valid);
+      BindU64(st, c, cg.nr_periods, cg.cpu_valid);
+      BindU64(st, c, cg.nr_throttled, cg.cpu_valid);
+      BindU64(st, c, cg.throttled_usec, cg.cpu_valid);
+      BindBool(st, c, cg.cpu_valid);
+      BindU64(st, c, cg.memory_current_bytes, cg.memory_valid);
+      if (cg.memory_valid && cg.memory_max_unlimited)
+        sqlite3_bind_null(st, c++);
+      else
+        BindU64(st, c, cg.memory_max_bytes, cg.memory_valid);
+      if (cg.memory_valid)
+        BindBool(st, c, cg.memory_max_unlimited);
+      else
+        sqlite3_bind_null(st, c++);
+      BindU64(st, c, cg.memory_events_low, cg.memory_valid);
+      BindU64(st, c, cg.memory_events_high, cg.memory_valid);
+      BindU64(st, c, cg.memory_events_max, cg.memory_valid);
+      BindU64(st, c, cg.memory_events_oom, cg.memory_valid);
+      BindU64(st, c, cg.memory_events_oom_kill, cg.memory_valid);
+      BindBool(st, c, cg.memory_valid);
+      const PsiWindow* cps[2] = {&cg.cpu_psi, &cg.memory_psi};
+      for (int k = 0; k < 2; ++k) {
+        const PsiWindow& p = *cps[k];
+        if (p.some_valid) {
+          sqlite3_bind_double(st, c++, p.avg10);
+          sqlite3_bind_double(st, c++, p.avg60);
+          sqlite3_bind_double(st, c++, p.avg300);
+        } else {
+          sqlite3_bind_null(st, c++);
+          sqlite3_bind_null(st, c++);
+          sqlite3_bind_null(st, c++);
+        }
+        BindBool(st, c, p.some_valid);
+        if (p.full_valid) {
+          sqlite3_bind_double(st, c++, p.avg10);
+          sqlite3_bind_double(st, c++, p.avg60);
+          sqlite3_bind_double(st, c++, p.avg300);
+        } else {
+          sqlite3_bind_null(st, c++);
+          sqlite3_bind_null(st, c++);
+          sqlite3_bind_null(st, c++);
+        }
+        BindBool(st, c, p.full_valid);
+      }
+      Step(S_CGROUP_INS, "cgroup");
+    }
+  }
+  for (const auto& io : cg.io) {
+    st = Prep(S_CGROUP_IO_INS);
+    if (!st) return;
+    sqlite3_reset(st);
+    int c = 1;
+    sqlite3_bind_int64(st, c++, (sqlite3_int64)cg.ts_ns);
+    sqlite3_bind_int(st, c++, (int)io.major);
+    sqlite3_bind_int(st, c++, (int)io.minor);
+    sqlite3_bind_int64(st, c++, (sqlite3_int64)io.rbytes);
+    sqlite3_bind_int64(st, c++, (sqlite3_int64)io.wbytes);
+    sqlite3_bind_int64(st, c++, (sqlite3_int64)io.rios);
+    sqlite3_bind_int64(st, c++, (sqlite3_int64)io.wios);
+    sqlite3_bind_int64(st, c++, (sqlite3_int64)io.dbytes);
+    sqlite3_bind_int64(st, c++, (sqlite3_int64)io.dios);
+    Step(S_CGROUP_IO_INS, "cgroup_io");
   }
 }
 
@@ -590,7 +1084,8 @@ void OutputWriter::WriteAnomalyFeatures(const nlohmann::json& f) {
     sqlite3_bind_int64(st, c++, eb.value("switch_total", 0ULL));
     sqlite3_bind_int64(st, c++, eb.value("io_ops_total", 0ULL));
     sqlite3_bind_int64(st, c++, eb.value("io_bytes_total", 0ULL));
-    sqlite3_bind_int64(st, c++, eb.value("faults_total", 0ULL));
+    sqlite3_bind_int64(st, c++, eb.value("minor_faults_total", 0ULL));
+    sqlite3_bind_int64(st, c++, eb.value("major_faults_total", 0ULL));
     sqlite3_bind_int64(st, c++, eb.value("lock_waits_total", 0ULL));
     Step(S_ANOMALY_INS, "anomaly");
   }
@@ -664,19 +1159,6 @@ void OutputWriter::WriteMemoryEvent(const nlohmann::json& e) {
     sqlite3_bind_int64(st, 4, e.value("nr_reclaimed", 0ULL));
     Step(S_MEMEV_INS, "memory_events");
   }
-}
-
-void OutputWriter::WriteIoDevice(const nlohmann::json& e) {
-  if (!db_) return;
-  sqlite3_stmt* st = Prep(S_IODEV_INS);
-  if (!st) return;
-  sqlite3_reset(st);
-  sqlite3_bind_int64(st, 1, (sqlite3_int64)e.value("ts_ns", 0ULL));
-  sqlite3_bind_int64(st, 2, e.value("dev", 0ULL));
-  sqlite3_bind_int64(st, 3, e.value("ops", 0ULL));
-  sqlite3_bind_int64(st, 4, e.value("bytes", 0ULL));
-  sqlite3_bind_int64(st, 5, e.value("lat_sum", 0ULL));
-  Step(S_IODEV_INS, "io_devices");
 }
 
 void OutputWriter::WriteBpfStats(const BpfStatsSnapshot& s) {
@@ -833,7 +1315,7 @@ void OutputWriter::WriteFoldedLine(const std::string& kind, const std::string& f
 }
 
 void OutputWriter::WriteDeepSyscall(uint32_t tid, uint32_t id, uint64_t count, float avg_us,
-                                    float p50_us, float p99_us) {
+                                    float p50_us, float p99_us, uint64_t error_count) {
   if (!db_ || ordinal_ < 0) return;
   sqlite3_stmt* st = Prep(S_SYSCALL_INS);
   if (!st) return;
@@ -847,6 +1329,7 @@ void OutputWriter::WriteDeepSyscall(uint32_t tid, uint32_t id, uint64_t count, f
   sqlite3_bind_double(st, 6, avg_us);
   sqlite3_bind_double(st, 7, p50_us);
   sqlite3_bind_double(st, 8, p99_us);
+  sqlite3_bind_int64(st, 9, (sqlite3_int64)error_count);
   Step(S_SYSCALL_INS, "deep_syscall");
 }
 
@@ -883,7 +1366,8 @@ void OutputWriter::WriteDeepRunq(uint32_t tid, uint64_t count, float avg_us, flo
 }
 
 void OutputWriter::WriteDeepIoFile(uint32_t dev, uint64_t ino, const char* path, uint64_t bytes,
-                                   uint32_t ops) {
+                                   uint32_t ops, uint64_t errors, uint64_t lat_sum,
+                                   const uint32_t* hist, float p50_us, float p99_us) {
   if (!db_ || ordinal_ < 0) return;
   sqlite3_stmt* st = Prep(S_IOFILE_INS);
   if (!st) return;
@@ -894,7 +1378,172 @@ void OutputWriter::WriteDeepIoFile(uint32_t dev, uint64_t ino, const char* path,
   sqlite3_bind_text(st, 4, path ? path : "", -1, SQLITE_TRANSIENT);
   sqlite3_bind_int64(st, 5, (sqlite3_int64)bytes);
   sqlite3_bind_int64(st, 6, ops);
+  sqlite3_bind_int64(st, 7, (sqlite3_int64)errors);
+  sqlite3_bind_int64(st, 8, (sqlite3_int64)lat_sum);
+  std::string h = HistJson(hist ? hist : (const uint32_t*)nullptr, 0);
+  // HistJson with bins=0 is empty; bind real bins below.
+  h = hist ? HistJson(hist, kBase4HistBins) : "[]";
+  sqlite3_bind_text(st, 9, h.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_double(st, 10, p50_us);
+  sqlite3_bind_double(st, 11, p99_us);
   Step(S_IOFILE_INS, "deep_iofile");
+}
+
+void OutputWriter::WriteDeepProcess(const DeepProcessRow& r) {
+  if (!db_ || ordinal_ < 0) return;
+  sqlite3_stmt* st = Prep(S_DEEP_PROC_INS);
+  if (!st) return;
+  sqlite3_reset(st);
+  int c = 1;
+  sqlite3_bind_int(st, c++, ordinal_);
+  sqlite3_bind_int64(st, c++, (sqlite3_int64)r.ts_ns);
+  sqlite3_bind_int64(st, c++, r.tid);
+  sqlite3_bind_int64(st, c++, r.tgid);
+  BindText(st, c, r.comm);
+  BindU64(st, c, r.vm_rss_kb, r.status_valid);
+  BindU64(st, c, r.rss_anon_kb, r.status_valid);
+  BindU64(st, c, r.rss_file_kb, r.status_valid);
+  BindU64(st, c, r.rss_shmem_kb, r.status_valid);
+  BindU64(st, c, r.vm_swap_kb, r.status_valid);
+  BindBool(st, c, r.status_valid);
+  BindU64(st, c, r.rchar, r.io_valid);
+  BindU64(st, c, r.wchar, r.io_valid);
+  BindU64(st, c, r.read_bytes, r.io_valid);
+  BindU64(st, c, r.write_bytes, r.io_valid);
+  BindU64(st, c, r.syscr, r.io_valid);
+  BindU64(st, c, r.syscw, r.io_valid);
+  BindBool(st, c, r.io_valid);
+  BindU64(st, c, r.sched_exec_runtime_ns, r.sched_valid);
+  BindU64(st, c, r.sched_run_delay_ns, r.sched_valid);
+  BindU64(st, c, r.sched_switch_count, r.sched_valid);
+  BindBool(st, c, r.sched_valid);
+  BindBool(st, c, r.available);
+  BindText(st, c, r.error);
+  Step(S_DEEP_PROC_INS, "deep_proc");
+}
+
+void OutputWriter::WriteDeepIoDevice(const DeepIoDeviceRow& r) {
+  if (!db_ || ordinal_ < 0) return;
+  sqlite3_stmt* st = Prep(S_DEEP_IODEV_INS);
+  if (!st) return;
+  sqlite3_reset(st);
+  sqlite3_bind_int(st, 1, ordinal_);
+  sqlite3_bind_int64(st, 2, r.dev);
+  sqlite3_bind_int64(st, 3, (sqlite3_int64)r.ops);
+  sqlite3_bind_int64(st, 4, (sqlite3_int64)r.bytes);
+  sqlite3_bind_int64(st, 5, (sqlite3_int64)r.lat_sum);
+  std::string h = HistJson(r.hist, kBase4HistBins);
+  sqlite3_bind_text(st, 6, h.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_double(st, 7, r.p50_us);
+  sqlite3_bind_double(st, 8, r.p99_us);
+  Step(S_DEEP_IODEV_INS, "deep_io_device");
+}
+
+void OutputWriter::WriteDeepNetFlow(const DeepNetFlowRow& r) {
+  if (!db_ || ordinal_ < 0) return;
+  sqlite3_stmt* st = Prep(S_NET_FLOW_INS);
+  if (!st) return;
+  sqlite3_reset(st);
+  int c = 1;
+  sqlite3_bind_int(st, c++, ordinal_);
+  sqlite3_bind_int64(st, c++, (sqlite3_int64)r.cookie);
+  sqlite3_bind_int64(st, c++, r.tgid);
+  sqlite3_bind_int64(st, c++, r.tid);
+  sqlite3_bind_int64(st, c++, (sqlite3_int64)r.netns_ino);
+  sqlite3_bind_int64(st, c++, r.family);
+  sqlite3_bind_int64(st, c++, (sqlite3_int64)r.local_addr);
+  sqlite3_bind_int64(st, c++, r.local_port);
+  sqlite3_bind_int64(st, c++, (sqlite3_int64)r.remote_addr);
+  sqlite3_bind_int64(st, c++, r.remote_port);
+  sqlite3_bind_int64(st, c++, r.final_state);
+  sqlite3_bind_int64(st, c++, (sqlite3_int64)r.start_ts_ns);
+  sqlite3_bind_int64(st, c++, (sqlite3_int64)r.established_ts_ns);
+  sqlite3_bind_int64(st, c++, (sqlite3_int64)r.end_ts_ns);
+  sqlite3_bind_int64(st, c++, (sqlite3_int64)r.duration_us);
+  sqlite3_bind_int64(st, c++, (sqlite3_int64)r.connect_latency_us);
+  sqlite3_bind_int64(st, c++, (sqlite3_int64)r.tx_bytes);
+  sqlite3_bind_int64(st, c++, (sqlite3_int64)r.rx_bytes);
+  sqlite3_bind_int64(st, c++, (sqlite3_int64)r.retransmits);
+  sqlite3_bind_int64(st, c++, r.rst_reason);
+  sqlite3_bind_int64(st, c++, (sqlite3_int64)r.rtt_count);
+  sqlite3_bind_int64(st, c++, (sqlite3_int64)r.rtt_avg_us);
+  sqlite3_bind_int64(st, c++, (sqlite3_int64)r.rtt_p50_us);
+  sqlite3_bind_int64(st, c++, (sqlite3_int64)r.rtt_p99_us);
+  BindBool(st, c, r.closed);
+  BindBool(st, c, r.owner_available);
+  BindText(st, c, r.error);
+  Step(S_NET_FLOW_INS, "deep_net_flow");
+}
+
+void OutputWriter::WriteDeepNetDrop(const DeepNetDropRow& r) {
+  if (!db_ || ordinal_ < 0) return;
+  sqlite3_stmt* st = Prep(S_NET_DROP_INS);
+  if (!st) return;
+  sqlite3_reset(st);
+  int c = 1;
+  sqlite3_bind_int(st, c++, ordinal_);
+  sqlite3_bind_int64(st, c++, (sqlite3_int64)r.netns_ino);
+  sqlite3_bind_int64(st, c++, r.ifindex);
+  sqlite3_bind_int(st, c++, (int)r.reason_id);
+  BindText(st, c, r.reason);
+  sqlite3_bind_int64(st, c++, (sqlite3_int64)r.count);
+  Step(S_NET_DROP_INS, "deep_net_drop");
+}
+
+void OutputWriter::WriteDeepNetSoftirq(const DeepNetSoftirqRow& r) {
+  if (!db_ || ordinal_ < 0) return;
+  sqlite3_stmt* st = Prep(S_NET_SOFTIRQ_INS);
+  if (!st) return;
+  sqlite3_reset(st);
+  int c = 1;
+  sqlite3_bind_int(st, c++, ordinal_);
+  sqlite3_bind_int64(st, c++, r.cpu_idx);
+  sqlite3_bind_int(st, c++, (int)r.vector);
+  BindText(st, c, r.vector_name);
+  sqlite3_bind_int64(st, c++, (sqlite3_int64)r.count);
+  sqlite3_bind_int64(st, c++, (sqlite3_int64)r.time_ns);
+  BindText(st, c, r.hist);
+  Step(S_NET_SOFTIRQ_INS, "deep_net_softirq");
+}
+
+void OutputWriter::WriteDeepGpuProcess(const DeepGpuProcessRow& r) {
+  if (!db_ || ordinal_ < 0) return;
+  sqlite3_stmt* st = Prep(S_DEEP_GPU_PROC_INS);
+  if (!st) return;
+  sqlite3_reset(st);
+  int c = 1;
+  sqlite3_bind_int(st, c++, ordinal_);
+  sqlite3_bind_int64(st, c++, (sqlite3_int64)r.ts_ns);
+  BindText(st, c, r.gpu_uuid);
+  sqlite3_bind_int64(st, c++, r.pid);
+  sqlite3_bind_int64(st, c++, r.tgid);
+  BindText(st, c, r.comm);
+  BindText(st, c, r.source);
+  sqlite3_bind_double(st, c++, r.sm_util_pct);
+  sqlite3_bind_double(st, c++, r.mem_util_pct);
+  sqlite3_bind_double(st, c++, r.enc_util_pct);
+  sqlite3_bind_double(st, c++, r.dec_util_pct);
+  sqlite3_bind_int64(st, c++, (sqlite3_int64)r.fb_used_bytes);
+  sqlite3_bind_int64(st, c++, (sqlite3_int64)r.source_ts_us);
+  sqlite3_bind_int64(st, c++, (sqlite3_int64)r.valid_mask);
+  BindText(st, c, r.error);
+  Step(S_DEEP_GPU_PROC_INS, "deep_gpu_process");
+}
+
+void OutputWriter::WriteDeepOffcpu(const DeepOffcpuRow& r) {
+  if (!db_ || ordinal_ < 0) return;
+  sqlite3_stmt* st = Prep(S_OFFCPU_INS);
+  if (!st) return;
+  sqlite3_reset(st);
+  int c = 1;
+  sqlite3_bind_int(st, c++, ordinal_);
+  sqlite3_bind_int64(st, c++, r.tid);
+  sqlite3_bind_int64(st, c++, r.tgid);
+  BindText(st, c, r.comm);
+  sqlite3_bind_int64(st, c++, (sqlite3_int64)r.dwell_ns);
+  sqlite3_bind_int64(st, c++, (sqlite3_int64)r.count);
+  sqlite3_bind_int(st, c++, r.stack_available);
+  Step(S_OFFCPU_INS, "deep_offcpu");
 }
 
 // ---------------------------------------------------------------------------

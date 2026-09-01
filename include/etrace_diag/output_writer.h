@@ -32,11 +32,11 @@ class OutputWriter {
   std::string db_path() const { return session_dir_ + "/etrace.sqlite3"; }
 
   // BASE outputs.
-  void WriteHostRow(const HostSnapshot& s);              // host + host_cpu + host_disk + host_proc
+  void WriteHostRow(const HostSnapshot& s, const NetworkSnapshot& net,
+                    const GpuSnapshot& gpu, const CgroupSnapshot& cg);
   void WriteAnomalyFeatures(const nlohmann::json& f);    // anomaly + anomaly_tid (from ebpf.*/seq)
   void WriteTargetsEvent(const nlohmann::json& e);       // targets_log: action/tgid/tid/comm/score/rank
   void WriteMemoryEvent(const nlohmann::json& e);        // has "pid" -> oom_events; else memory_events
-  void WriteIoDevice(const nlohmann::json& e);           // io_devices
   void WriteBpfStats(const BpfStatsSnapshot& s);         // bpf_stats (one row per prog)
   void WriteProcOverhead(const ProcOverhead& s);         // proc_overhead
   void WriteLogLine(const std::string& line);            // logs (logger sink; full raw line)
@@ -52,11 +52,20 @@ class OutputWriter {
   void WriteFoldedLine(const std::string& kind, const std::string& frames, uint64_t value);
   // id 为系统调用号，name 为对应系统调用名（read/write/open/...，writer 内查表）。
   void WriteDeepSyscall(uint32_t tid, uint32_t id, uint64_t count, float avg_us,
-                        float p50_us, float p99_us);
+                        float p50_us, float p99_us, uint64_t error_count);
   // sym 为锁地址解析出的内核符号（"name+0x..."，由调用方经 KernelSym 解析）。
   void WriteDeepLock(uint64_t addr, uint64_t count, uint64_t lat_sum, const char* sym);
   void WriteDeepRunq(uint32_t tid, uint64_t count, float avg_us, float p50_us, float p99_us);
-  void WriteDeepIoFile(uint32_t dev, uint64_t ino, const char* path, uint64_t bytes, uint32_t ops);
+  void WriteDeepIoFile(uint32_t dev, uint64_t ino, const char* path, uint64_t bytes,
+                       uint32_t ops, uint64_t errors, uint64_t lat_sum, const uint32_t* hist,
+                       float p50_us, float p99_us);
+  void WriteDeepProcess(const DeepProcessRow& r);        // deep_proc
+  void WriteDeepIoDevice(const DeepIoDeviceRow& r);      // deep_io_device
+  void WriteDeepNetFlow(const DeepNetFlowRow& r);        // deep_net_flow
+  void WriteDeepNetDrop(const DeepNetDropRow& r);        // deep_net_drop
+  void WriteDeepNetSoftirq(const DeepNetSoftirqRow& r);  // deep_net_softirq
+  void WriteDeepGpuProcess(const DeepGpuProcessRow& r);  // deep_gpu_process
+  void WriteDeepOffcpu(const DeepOffcpuRow& r);          // deep_offcpu
 
   // Nested write batching: BEGIN IMMEDIATE on first BeginBatch, COMMIT on the
   // outermost CommitBatch. Write failures log and continue (observation-grade).

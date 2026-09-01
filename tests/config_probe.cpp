@@ -50,8 +50,13 @@ int main(int argc, char** argv) {
   CHECK(cfg.targets.concurrency_factor == 2.0, "concurrency_factor default");
   CHECK(cfg.model.anomaly_url == "ws://127.0.0.1:9001/anomaly", "anomaly url");
   CHECK(cfg.model.adapter == "ws", "adapter default");
+  CHECK(cfg.devices.network_enabled == true, "devices.network_enabled default");
+  CHECK(cfg.devices.deep_network_enabled == true, "devices.deep_network_enabled default");
+  CHECK(cfg.devices.gpu_source == "auto", "devices.gpu_source default");
+  CHECK(cfg.devices.deep_gpu_enabled == true, "devices.deep_gpu_enabled default");
+  CHECK(cfg.devices.deep_gpu_interval_ms == 100, "devices.deep_gpu_interval_ms default");
+  CHECK(cfg.devices.net_event_sample_rate == 16, "devices.net_event_sample_rate default");
   CHECK(cfg.targets.weights.cpu == 0.35, "weight cpu");
-  CHECK(cfg.targets.weights.swch == 0.15, "weight switch");
   CHECK(cfg.misc.categories.size() == 5, "categories count");
 
   // Round-trip: to_json -> from_json preserves values.
@@ -63,12 +68,24 @@ int main(int argc, char** argv) {
 
   // Env override beats JSON.
   setenv("ETRACE_DIAG_SAMPLE_FINE_INTERVAL_MS", "50", 1);
+  setenv("ETRACE_DIAG_DEVICES_GPU_SOURCE", "off", 1);
+  setenv("ETRACE_DIAG_DEVICES_DEEP_GPU_INTERVAL_MS", "7", 1);   // clamps to 10
+  setenv("ETRACE_DIAG_DEVICES_NET_EVENT_SAMPLE_RATE", "200000", 1);  // clamps to 100000
   Config cfg3 = cfg;
   bool applied = ApplyEnvOverrides(cfg3);
   CHECK(applied, "env override applied");
   CHECK(cfg3.sample.fine_interval_ms == 50, "env override value");
+  CHECK(cfg3.devices.gpu_source == "off", "env gpu_source override");
+  Sanitize(cfg3);
+  CHECK(cfg3.devices.deep_gpu_interval_ms == 10, "gpu interval clamp");
+  CHECK(cfg3.devices.net_event_sample_rate == 100000, "net rate clamp");
+  CHECK(cfg3.devices.gpu_source == "off", "gpu source accepted after sanitize");
 
-  // Sanitize clamps invalid ranges.
+  // Sanitize rejects an unknown gpu source back to auto.
+  Config bad_src = cfg;
+  bad_src.devices.gpu_source = "cuda";
+  Sanitize(bad_src);
+  CHECK(bad_src.devices.gpu_source == "auto", "unknown gpu source -> auto");
   Config bad = cfg;
   bad.targets.leave_rank = 5;  // below enter_rank
   Sanitize(bad);

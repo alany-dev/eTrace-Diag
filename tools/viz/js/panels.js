@@ -25,6 +25,16 @@
       series: [{ family: 'host.proc.*.cpu_pct', mode: 'top', sel: [5] }] },
     { id: 'p' + rid(), title: 'BPF 程序开销', height: 220, kind: 'line',
       series: [{ mid: 'bpf.prog.on_switch.ms_per_s' }] },
+    { id: 'p' + rid(), title: '网络重传', height: 180, kind: 'line',
+      series: [{ mid: 'net.tcp.retrans_s' }, { mid: 'net.tcp.timeouts_s' }] },
+    { id: 'p' + rid(), title: '网络流量', height: 180, kind: 'line',
+      series: [{ family: 'net.iface.*.rx_mbps', mode: 'all', sel: [] },
+               { family: 'net.iface.*.tx_mbps', mode: 'all', sel: [] }] },
+    { id: 'p' + rid(), title: 'GPU 利用率', height: 180, kind: 'line',
+      series: [{ family: 'gpu.*.util_pct', mode: 'all', sel: [] },
+               { family: 'gpu.*.mem_pct', mode: 'all', sel: [] }] },
+    { id: 'p' + rid(), title: 'cgroup 节流', height: 180, kind: 'line',
+      series: [{ mid: 'cgroup.cpu_throttled_pct' }, { mid: 'cgroup.mem_current_mb' }] },
   ];
 
   function rid() { return Math.random().toString(36).slice(2, 8); }

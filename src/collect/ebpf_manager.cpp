@@ -1,6 +1,7 @@
 #include "collect/ebpf_manager.h"
 
 #include <bpf/bpf.h>
+#include <bpf/btf.h>
 #include <dlfcn.h>
 
 #include <linux/perf_event.h>
@@ -180,12 +181,18 @@ bool EbpfManager::AttachAlwaysOn() {
   return true;
 }
 
-bool EbpfManager::Load() {
+bool EbpfManager::Open() {
+  if (skel_) return true;
   skel_ = etrace_bpf__open();
   if (!skel_) {
     LogError("etrace_bpf__open: %s", strerror(errno));
     return false;
   }
+  return true;
+}
+
+bool EbpfManager::Load() {
+  if (!Open()) return false;
 
   int err = etrace_bpf__load(skel_);
   if (err) {
@@ -237,10 +244,10 @@ bool EbpfManager::WriteSnapshotCfg(u32 interval_ms) {
   return bpf_map_update_elem(bpf_map__fd(Map("snapshot_cfg")), &key, &interval_ms, BPF_ANY) == 0;
 }
 
-bool EbpfManager::WriteSampleRateCfg(u32 offcpu, u32 iofile) {
+bool EbpfManager::WriteSampleRateCfg(u32 offcpu, u32 iofile, u32 net_rate) {
   u32 key = 0;
   u32 thresh = iofile ? (u32)(0xFFFFFFFFULL / iofile) : 0;
-  struct { u32 offcpu; u32 iofile_thresh; } v = {offcpu, thresh};
+  struct { u32 offcpu; u32 iofile_thresh; u32 net_rate; } v = {offcpu, thresh, net_rate};
   return bpf_map_update_elem(bpf_map__fd(Map("sample_rate_cfg")), &key, &v, BPF_ANY) == 0;
 }
 
@@ -262,6 +269,13 @@ bool EbpfManager::ArmTimer(u64 interval_ms, bool cancel) {
   int err = bpf_prog_test_run_opts(fd, &opts);
   if (err && errno) LogWarn("arm_snapshotter test_run: %s", strerror(errno));
   return err == 0;
+}
+
+bool EbpfManager::WriteIntFlag(const char* name, u32 v) {
+  struct bpf_map* m = Map(name);
+  if (!m) return false;
+  u32 key = 0;
+  return bpf_map_update_elem(bpf_map__fd(m), &key, &v, BPF_ANY) == 0;
 }
 
 bool EbpfManager::WriteNcpus(int n) {
@@ -388,21 +402,113 @@ bool EbpfManager::ReadProcessTable(std::vector<ProcessRow>& out) {
       leftover.erase(0, pos + 1);
       ProcessRow r;
       char comm[16] = {0};
-      if (sscanf(line.c_str(), "%u %u %15s %hhu %llu %llu %llu %llu %llu %llu",
-                 &r.pid, &r.tgid, comm, &r.state,
-                 (unsigned long long*)&r.start_time,
-                 (unsigned long long*)&r.utime, (unsigned long long*)&r.stime,
-                 (unsigned long long*)&r.nvcsw, (unsigned long long*)&r.nivcsw,
-                 (unsigned long long*)&r.total_vm) == 10) {
-        strncpy(r.comm, comm, 15);
-        r.comm[15] = 0;
-        out.push_back(r);
+      // iter emits A/B/C triples (bpf_seq_printf caps at 12 varargs).
+      char tag = line[0];
+      if (tag == 'A' || tag == 'B' || tag == 'C') {
+        if (tag == 'A') {
+          if (sscanf(line.c_str(),
+                     "A %u %u %15s %hhu %llu %llu %llu %llu %llu %llu %llu",
+                     &r.pid, &r.tgid, comm, &r.state,
+                     (unsigned long long*)&r.start_time,
+                     (unsigned long long*)&r.utime, (unsigned long long*)&r.stime,
+                     (unsigned long long*)&r.nvcsw, (unsigned long long*)&r.nivcsw,
+                     (unsigned long long*)&r.minflt, (unsigned long long*)&r.majflt) == 11) {
+            strncpy(r.comm, comm, 15);
+            r.comm[15] = 0;
+            r.ioac_valid = true;
+            r.sched_valid = true;
+            out.push_back(r);
+          }
+        } else if (tag == 'B') {
+          if (!out.empty()) {
+            ProcessRow& last = out.back();
+            if (sscanf(line.c_str(),
+                       "B %u %llu %llu %llu %llu %llu %llu %llu %llu %llu",
+                       &last.pid,
+                       (unsigned long long*)&last.total_vm,
+                       (unsigned long long*)&last.rchar, (unsigned long long*)&last.wchar,
+                       (unsigned long long*)&last.syscr, (unsigned long long*)&last.syscw,
+                       (unsigned long long*)&last.read_bytes, (unsigned long long*)&last.write_bytes,
+                       (unsigned long long*)&last.sum_exec_runtime_ns,
+                       (unsigned long long*)&last.run_delay_ns) == 10) {
+            } else {
+              out.pop_back();
+            }
+          }
+        } else if (tag == 'C') {
+          if (!out.empty()) {
+            ProcessRow& last = out.back();
+            if (sscanf(line.c_str(),
+                       "C %u %llu %llu %llu %llu",
+                       &last.pid,
+                       (unsigned long long*)&last.rss_anon_pages,
+                       (unsigned long long*)&last.rss_file_pages,
+                       (unsigned long long*)&last.rss_shmem_pages,
+                       (unsigned long long*)&last.swap_ents) == 5) {
+              last.rss_kb = (last.rss_anon_pages + last.rss_file_pages +
+                             last.rss_shmem_pages) * 4;
+              last.rss_valid =
+                  (last.rss_anon_pages + last.rss_file_pages + last.rss_shmem_pages) > 0;
+            } else {
+              out.pop_back();
+            }
+          }
+        }
       }
     }
   }
   close(it_fd);
   bpf_link__destroy(link);
   return !out.empty();
+}
+
+void EbpfManager::ResetTidCounters(uint32_t tid) {
+  const char* maps[] = {
+      "on_cpu_ns",  "switches",   "block_io",    "faults",      "lock_st",
+      "sys_st",     "futex_st",   "runq_st",     "wakeup_ts",   "offcpu_stash",
+      "offcpu_last_ts", "sys_start", "io_start", "connect_start", "sock_owner",
+  };
+  for (const char* n : maps) {
+    struct bpf_map* m = Map(n);
+    if (m) bpf_map_delete_elem(bpf_map__fd(m), &tid);
+  }
+}
+
+void EbpfManager::SetOptionalAutoload(const std::vector<const char*>& names,
+                                      std::vector<std::string>* unavailable) {
+  if (!skel_) return;
+  for (const char* n : names) {
+    struct bpf_program* p = Prog(n);
+    if (!p) {
+      if (unavailable) unavailable->push_back(std::string(n) + ":missing-program");
+      continue;
+    }
+    if (bpf_program__set_autoload(p, false) != 0) {
+      if (unavailable) unavailable->push_back(std::string(n) + ":set-autoload-failed");
+    }
+  }
+}
+
+bool EbpfManager::HasTaskFaultFields() {
+  static int cached = -1;
+  if (cached >= 0) return cached != 0;
+  cached = 0;
+  struct btf* btf = btf__parse_raw("/sys/kernel/btf/vmlinux");
+  if (!btf) return false;
+  int id = btf__find_by_name_kind(btf, "task_struct", BTF_KIND_STRUCT);
+  if (id > 0) {
+    const struct btf_type* t = btf__type_by_id(btf, (unsigned)id);
+    if (t) {
+      const struct btf_member* m = btf_members(t);
+      for (unsigned i = 0; i < BTF_INFO_VLEN(t->info); ++i) {
+        const char* name = btf__name_by_offset(btf, m[i].name_off);
+        if (name && strcmp(name, "min_flt") == 0) cached = 1;
+        if (name && strcmp(name, "maj_flt") == 0 && cached == 1) { /* both found */ }
+      }
+    }
+  }
+  btf__free(btf);
+  return cached != 0;
 }
 
 bool EbpfManager::CollectProgramStats(std::vector<BpfProgStats>& out) {

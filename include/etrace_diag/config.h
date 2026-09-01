@@ -62,6 +62,15 @@ struct TargetsTunables {
   TargetWeights weights;
 };
 
+struct DeviceTunables {
+  bool network_enabled = true;
+  bool deep_network_enabled = true;
+  std::string gpu_source = "auto";  // auto | off | nvml | drm
+  bool deep_gpu_enabled = true;
+  uint64_t deep_gpu_interval_ms = 100;
+  uint32_t net_event_sample_rate = 16;  // 1/N sampling for kfree_skb / RTT
+};
+
 struct ModelTunables {
   std::string anomaly_url = "ws://127.0.0.1:9001/anomaly";
   uint64_t anomaly_timeout_ms = 5000;
@@ -83,6 +92,7 @@ struct MiscTunables {
   bool enable_bpf_stats = true;  // attempt kernel.bpf_stats_enabled=1 at startup
 };
 
+// Built-in defaults.
 struct Config {
   SampleTunables sample;
   WindowTunables window;
@@ -90,6 +100,7 @@ struct Config {
   ModelTunables model;
   OutputTunables output;
   MiscTunables misc;
+  DeviceTunables devices;
 };
 
 // Built-in defaults.
@@ -100,7 +111,6 @@ Config DefaultConfig();
 // malformed reload never destabilizes a running collector.
 void Sanitize(Config& cfg);
 
-// JSON <-> Config (dotted paths become nested JSON objects).
 void to_json(nlohmann::json& j, const Config& c);
 void from_json(const nlohmann::json& j, Config& c);
 

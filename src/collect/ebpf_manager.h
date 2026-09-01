@@ -47,8 +47,11 @@ class EbpfManager {
  public:
   ~EbpfManager();
 
-  bool Load();   // open + load + attach always-on programs
+  // Opens the skeleton (needed before SetOptionalAutoload). Load() calls it.
+  bool Open();
+  bool Load();   // open (if needed) + load + attach always-on programs
   void Close();
+
 
   struct etrace_bpf* skel() { return skel_; }
   struct bpf_map* Map(const char* name);
@@ -56,8 +59,9 @@ class EbpfManager {
 
   bool SetDeep(bool on);
   bool WriteSnapshotCfg(uint32_t interval_ms);
-  bool WriteSampleRateCfg(uint32_t offcpu_rate, uint32_t iofile_rate);
+  bool WriteSampleRateCfg(uint32_t offcpu_rate, uint32_t iofile_rate, uint32_t net_rate);
   bool WriteNcpus(int n);
+  bool WriteIntFlag(const char* map, u32 v);
   bool ArmTimer(uint64_t interval_ms, bool cancel);
 
   // Recorder producer control, mode-agnostic:
@@ -72,7 +76,18 @@ class EbpfManager {
   bool AddTarget(uint32_t tid, uint32_t flags, uint32_t tgid, const char* comm);
   bool RemoveTarget(uint32_t tid);
 
+  // Deletes this tid's counters/stash from every per-tid map (join/leave) so a
+  // re-joined tid or PID reuse cannot produce recorder delta spikes. Global
+  // maps (lock_hot, dev_io) are intentionally untouched.
+  void ResetTidCounters(uint32_t tid);
+
   bool ReadProcessTable(std::vector<ProcessRow>& out);
+
+  // Disable autoload for optional programs before etrace_bpf__load. Optional
+  // programs missing on this kernel/tracefs are recorded in `unavailable`
+  // (name -> reason) for episode capabilities. Required programs stay autoload.
+  void SetOptionalAutoload(const std::vector<const char*>& names,
+                           std::vector<std::string>* unavailable);
 
   // Per-program run_cnt/run_time_ns via BPF_OBJ_GET_INFO_BY_FD.
   // Returns non-zero run_time_ns only when kernel.bpf_stats_enabled==1.
@@ -80,6 +95,10 @@ class EbpfManager {
 
   struct bpf_program* Prog(const char* name);
   StackSymbolizer& sym() { return sym_; }
+
+  // True when the running BTF has task_struct.min_flt/maj_flt (else the
+  // selector drops fault weighting and marks the source unavailable).
+  static bool HasTaskFaultFields();
 
  private:
   bool AttachAlwaysOn();

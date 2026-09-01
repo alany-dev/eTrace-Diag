@@ -11,7 +11,7 @@
   //   index.html?out=/data/runs     （任意服务器根下的输出目录）
   const DEFAULT_OUT = '/out';
 
-    // 列出输出目录下所有会话（HTTP 目录列表 → 解析 <a href="dir/"> 链接 →
+  // 列出输出目录下所有会话（HTTP 目录列表 → 解析 <a href="dir/"> 链接 →
   // 逐个探测 etrace.sqlite3 存在）。返回 [{name, dir}]，按名称倒序（最新在前）。
   async function listSessions(out) {
     const status = $('lblStatus');
@@ -101,10 +101,11 @@
     status.className = '';
     try {
       const db = await V.db.open(file);
-      // schema_version check
+      // schema_version check — only v2 sessions render; older versions are
+      // shown as explicitly unsupported (never drawn with a wrong schema).
       const ver = V.db.scalar(db, "SELECT value FROM meta WHERE key='schema_version'");
-      if (ver !== '1') {
-        status.textContent = 'DB 版本不支持 (schema_version=' + ver + ')';
+      if (ver !== '2') {
+        status.textContent = 'DB 版本不支持 (schema_version=' + ver + '，仅支持 v2)';
         status.className = 'err';
         return;
       }
@@ -262,7 +263,7 @@
   });
 
   // ------------------------------------------------------------------
-  // Panel edit dialog (step 8.4)
+  // Panel edit dialog
   // ------------------------------------------------------------------
   V.openPanelDialog = function (session, def) {
     const dlg = $('dlgPanel');
@@ -278,10 +279,13 @@
       ['anomaly', '目标计数'],
       ['proc_overhead', '采集器'],
       ['bpf_stats', 'BPF程序'],
-      ['io_devices', '块设备'],
       ['memory_events', '内存事件'],
       ['ebpf_tid', '目标线程'],
       ['host_proc', '进程'],
+      ['net_iface', '网络接口'],
+      ['net_stack', 'TCP协议栈'],
+      ['gpu', 'GPU'],
+      ['cgroup', 'cgroup'],
     ];
     const srcSel = V.el('select', {}, sources.map(([v, l]) => V.el('option', { value: v }, l)));
     const familySel = V.el('select', {});
@@ -300,14 +304,25 @@
         ['host.mem.avail_mb', '可用内存 (MB)'], ['host.mem.swap_used_pct', 'Swap占用 (%)'],
         ['host.vm.pgfault_s', '缺页 (次/s)'], ['host.vm.pgmajfault_s', '主缺页 (次/s)'],
         ['host.vm.pswpin_s', '换入 (次/s)'], ['host.vm.pswpout_s', '换出 (次/s)'],
-        ['host.psi.cpu.avg10', 'PSI cpu avg10 (%)'], ['host.psi.io.avg10', 'PSI io avg10 (%)'],
-        ['host.psi.mem.avg10', 'PSI mem avg10 (%)'], ['host.psi.cpu.avg60', 'PSI cpu avg60 (%)'],
-        ['host.psi.io.avg60', 'PSI io avg60 (%)'], ['host.psi.mem.avg60', 'PSI mem avg60 (%)'],
-        ['host.psi.cpu.avg300', 'PSI cpu avg300 (%)'], ['host.psi.io.avg300', 'PSI io avg300 (%)'],
-        ['host.psi.mem.avg300', 'PSI mem avg300 (%)'],
-        ['host.cpu.core.*.usage_pct', '核利用率 (%) <参数>'], ['host.disk.*.util_pct', '盘繁忙度 (%) <参数>'],
-        ['host.disk.*.read_mbs', '盘读 (MB/s) <参数>'], ['host.disk.*.write_mbs', '盘写 (MB/s) <参数>'],
-        ['host.disk.*.read_await_ms', '盘读时延 (ms) <参数>'], ['host.disk.*.write_await_ms', '盘写时延 (ms) <参数>'],
+        ['host.psi.cpu.some.avg10', 'PSI cpu some avg10 (%)'],
+        ['host.psi.cpu.some.avg60', 'PSI cpu some avg60 (%)'],
+        ['host.psi.cpu.some.avg300', 'PSI cpu some avg300 (%)'],
+        ['host.psi.io.some.avg10', 'PSI io some avg10 (%)'],
+        ['host.psi.io.some.avg60', 'PSI io some avg60 (%)'],
+        ['host.psi.io.some.avg300', 'PSI io some avg300 (%)'],
+        ['host.psi.io.full.avg10', 'PSI io full avg10 (%)'],
+        ['host.psi.mem.some.avg10', 'PSI mem some avg10 (%)'],
+        ['host.psi.mem.some.avg60', 'PSI mem some avg60 (%)'],
+        ['host.psi.mem.some.avg300', 'PSI mem some avg300 (%)'],
+        ['host.psi.mem.full.avg10', 'PSI mem full avg10 (%)'],
+        ['host.cpu.core.*.usage_pct', '核利用率 (%) <参数>'],
+        ['host.disk.*.util_pct', '盘繁忙度 (%) <参数>'],
+        ['host.disk.*.read_mbs', '盘读 (MB/s) <参数>'],
+        ['host.disk.*.write_mbs', '盘写 (MB/s) <参数>'],
+        ['host.disk.*.read_await_ms', '盘读时延 (ms) <参数>'],
+        ['host.disk.*.write_await_ms', '盘写时延 (ms) <参数>'],
+        ['host.disk.*.merged_ops_s', '盘合并操作 (次/s) <参数>'],
+        ['host.disk.*.avg_queue_ms', '盘加权队列 (ms) <参数>'],
       ];
       if (src === 'anomaly') return [
         ['ebpf.busy_pct', '目标线程总在核占比 (%)'], ['ebpf.switches_s', '切换 (次/s)'],
@@ -322,8 +337,6 @@
       ];
       if (src === 'bpf_stats') return [['bpf.prog.*.runs_s', '程序调用 (次/s) <程序>'],
         ['bpf.prog.*.ms_per_s', '内核耗时 (ms/s) <程序>']];
-      if (src === 'io_devices') return [['iodev.*.ops_s', '设备IOPS (次/s) <设备>'],
-        ['iodev.*.mbs', '设备吞吐 (MB/s) <设备>'], ['iodev.*.await_ms', '设备时延 (ms) <设备>']];
       if (src === 'memory_events') return [
         ['memv.kswapd', 'kswapd 活动 (0/1)'], ['memv.direct_reclaim_s', '直接回收 (次/s)'],
         ['memv.nr_reclaimed_s', '回收页速率 (次/s)'],
@@ -331,6 +344,33 @@
       if (src === 'ebpf_tid') return [['ebpf.tid.*.cpu_pct', '线程在核占比 (%)'], ['ebpf.tid.*.io_ops_s', '线程IOPS'],
         ['ebpf.tid.*.fault_s', '线程缺页'], ['ebpf.tid.*.switch_s', '线程切换'], ['ebpf.tid.*.lock_s', '线程锁等待']];
       if (src === 'host_proc') return [['host.proc.*.cpu_pct', '进程CPU (%)'], ['host.proc.*.rss_mb', '进程RSS (MB)']];
+      if (src === 'net_iface') return [
+        ['net.iface.*.rx_mbps', '接收 (MB/s) <接口>'], ['net.iface.*.tx_mbps', '发送 (MB/s) <接口>'],
+        ['net.iface.*.rx_pps', '收包 (包/s) <接口>'], ['net.iface.*.tx_pps', '发包 (包/s) <接口>'],
+        ['net.iface.*.rx_err_s', '收错 (次/s) <接口>'], ['net.iface.*.tx_err_s', '发错 (次/s) <接口>'],
+        ['net.iface.*.rx_drop_s', '收丢 (次/s) <接口>'], ['net.iface.*.tx_drop_s', '发丢 (次/s) <接口>'],
+      ];
+      if (src === 'net_stack') return [
+        ['net.tcp.active_opens_s', '主动建连 (次/s)'], ['net.tcp.passive_opens_s', '被动建连 (次/s)'],
+        ['net.tcp.attempt_fails_s', '建连失败 (次/s)'], ['net.tcp.estab_resets_s', '连接复位 (次/s)'],
+        ['net.tcp.retrans_s', '重传 (次/s)'], ['net.tcp.out_rsts_s', '发出RST (次/s)'],
+        ['net.tcp.syn_retrans_s', 'SYN重传 (次/s)'], ['net.tcp.timeouts_s', '超时 (次/s)'],
+        ['net.tcp.listen_overflows_s', 'listen溢出 (次/s)'], ['net.tcp.listen_drops_s', 'listen丢弃 (次/s)'],
+        ['net.tcp.udp_no_ports_s', 'UDP无端口 (次/s)'], ['net.tcp.curr_estab', '当前连接 (个)'],
+        ['net.tcp.sock_mem_kb', 'TCP内存 (KB)'],
+      ];
+      if (src === 'gpu') return [
+        ['gpu.*.util_pct', 'GPU利用率 (%) <设备>'], ['gpu.*.mem_used_mb', 'GPU显存 (MB) <设备>'],
+        ['gpu.*.mem_pct', 'GPU显存占比 (%) <设备>'], ['gpu.*.temp_c', 'GPU温度 (°C) <设备>'],
+        ['gpu.*.power_w', 'GPU功耗 (W) <设备>'], ['gpu.*.enc_pct', 'GPU编码 (%) <设备>'],
+        ['gpu.*.dec_pct', 'GPU解码 (%) <设备>'], ['gpu.*.pcie_rx_mbps', 'PCIe收 (MB/s) <设备>'],
+        ['gpu.*.pcie_tx_mbps', 'PCIe发 (MB/s) <设备>'],
+      ];
+      if (src === 'cgroup') return [
+        ['cgroup.cpu_usage_pct', 'cgroup CPU (%)'], ['cgroup.cpu_throttled_pct', 'cgroup 节流 (%)'],
+        ['cgroup.mem_current_mb', 'cgroup 内存 (MB)'], ['cgroup.mem_events_oom_s', 'cgroup OOM (次/s)'],
+        ['cgroup.cpu_psi_s10', 'cgroup PSI cpu avg10 (%)'],
+      ];
       return [];
     };
     const rebuildFamilies = () => {
@@ -351,8 +391,10 @@
         for (const d of (session?.enums.disks || [])) paramSel.appendChild(V.el('option', { value: d }, d));
       } else if (fam.startsWith('bpf.prog.')) {
         for (const p of (session?.enums.bpfProgs || [])) paramSel.appendChild(V.el('option', { value: p }, p));
-      } else if (fam.startsWith('iodev.')) {
-        for (const d of (session?.enums.iodevs || [])) paramSel.appendChild(V.el('option', { value: d }, d));
+      } else if (fam.startsWith('net.iface.')) {
+        for (const i of (session?.enums.ifaces || [])) paramSel.appendChild(V.el('option', { value: i.name }, i.name));
+      } else if (fam.startsWith('gpu.')) {
+        for (const g of (session?.enums.gpus || [])) paramSel.appendChild(V.el('option', { value: g }, g));
       }
     };
     srcSel.addEventListener('change', rebuildFamilies);
@@ -389,8 +431,10 @@
         entry.family = fam;
         entry.mode = 'top';
         entry.sel = [5];
+      } else if (fam.includes('*')) {
+        entry.mid = fam.replace('*', paramSel.value);
       } else {
-        entry.mid = fam.includes('*') ? fam.replace('*', paramSel.value) : fam;
+        entry.mid = fam;
       }
       editing.series.push(entry);
       renderChips();

@@ -11,9 +11,12 @@
 #include <thread>
 #include <unordered_set>
 
+#include "collect/bpf_values.h"
 #include "collect/deep_collector.h"
 #include "collect/ebpf_manager.h"
+#include "collect/gpu_metrics.h"
 #include "collect/host_metrics.h"
+#include "collect/network_metrics.h"
 #include "collect/target_selector.h"
 #include "etrace_diag/model_client.h"
 #include "etrace_diag/output_writer.h"
@@ -86,61 +89,65 @@ void RestoreBpfStats(const std::string& prev) {
   if (out.good()) out << prev << "\n";
 }
 
-// Mirrors of kernel per-tid counter values.
-struct SwitchVal { u32 vol; u32 invol; };
-struct BlockIoVal { u64 ops; u64 bytes; u64 lat_sum; u32 hist[13]; };
-struct FaultsVal { u32 minor; u32 major; };
-struct LatStatVal13 { u64 count; u64 lat_sum; u32 hist[13]; };
-struct MemEventsVal { u32 kswapd_active; u32 direct_reclaim; u64 nr_reclaimed; };
-struct OomEventVal { u64 ts; u32 pid; };
-
+// Aggregate current-target counters from the per-tid maps. CPU/switch/fault
+// come from the already-read process table where possible; I/O and lock still
+// come from the full block_io / lock_st maps, and lock_lat_ns is filled from
+// lock_st.lat_sum (never the old constant 0).
 EbpfCounters BuildEbpfCounters(EbpfManager& ebpf, uint64_t ts_ns,
-                               const std::unordered_set<uint32_t>& members) {
+                               const std::unordered_set<uint32_t>& members,
+                               const std::vector<ProcessRow>& process_table) {
   EbpfCounters c;
   c.ts_ns = ts_ns;
 
-  auto sum_block = [&](u32 tid, u64& ops, u64& bytes) {
-    BlockIoVal bi = {};
-    if (ebpf.Slice("block_io")->LookupPercpuSum(&tid, &bi)) {
-      ops = bi.ops;
-      bytes = bi.bytes;
-    }
-  };
-  auto sum_faults = [&](u32 tid, u64& minor, u64& major) {
-    FaultsVal ft = {};
-    if (ebpf.Slice("faults")->LookupPercpuSum(&tid, &ft)) {
-      minor = ft.minor;
-      major = ft.major;
-    }
-  };
-  auto sum_lock = [&](u32 tid, u64& waits) {
-    LatStatVal13 lk = {};
-    if (ebpf.Slice("lock_st")->LookupPercpuSum(&tid, &lk)) waits = lk.count;
-  };
+  std::unordered_map<u32, const ProcessRow*> by_tid;
+  by_tid.reserve(process_table.size());
+  for (const auto& r : process_table) by_tid[r.pid] = &r;
 
-  ebpf.Slice("on_cpu_ns")->ForEach([&](const void* key, const void* value) {
-    u32 tid = *(const u32*)key;
-    u64 on_cpu = *(const u64*)value;
+  for (u32 tid : members) {
     EbpfPerTidStats t;
     t.tid = tid;
-    t.on_cpu_ns = on_cpu;
     SwitchVal sw = {};
     if (ebpf.Slice("switches")->LookupPercpuSum(&tid, &sw)) {
       t.nr_sw_vol = sw.vol;
       t.nr_sw_invol = sw.invol;
     }
-    sum_block(tid, t.io_ops, t.io_bytes);
-    sum_faults(tid, t.pf_minor, t.pf_major);
-    sum_lock(tid, t.lock_waits);
+    BlockIoVal bi = {};
+    if (ebpf.Slice("block_io")->LookupPercpuSum(&tid, &bi)) {
+      t.io_ops = bi.ops;
+      t.io_bytes = bi.bytes;
+    }
+    FaultsVal ft = {};
+    if (ebpf.Slice("faults")->LookupPercpuSum(&tid, &ft)) {
+      t.pf_minor = ft.minor;
+      t.pf_major = ft.major;
+    }
+    LatStatVal13 lk = {};
+    if (ebpf.Slice("lock_st")->LookupPercpuSum(&tid, &lk)) {
+      t.lock_waits = lk.count;
+      t.lock_lat_ns = lk.lat_sum;  // must be populated, not left at 0
+    }
+    u64 on_cpu = 0;
+    if (!ebpf.Slice("on_cpu_ns")->LookupPercpuSum(&tid, &on_cpu)) on_cpu = 0;
+    t.on_cpu_ns = on_cpu;
+    if (t.on_cpu_ns == 0) {
+      auto it = by_tid.find(tid);
+      if (it != by_tid.end()) {
+        const double ticks_per_s = (double)sysconf(_SC_CLK_TCK);
+        t.on_cpu_ns = ticks_per_s > 0
+                          ? (u64)((it->second->utime + it->second->stime) * 1e9 / ticks_per_s)
+                          : 0;
+      }
+    }
 
-    c.on_cpu_ns_total += on_cpu;
+    c.on_cpu_ns_total += t.on_cpu_ns;
     c.switch_total += t.nr_sw_vol + t.nr_sw_invol;
     c.io_ops_total += t.io_ops;
     c.io_bytes_total += t.io_bytes;
-    c.faults_total += t.pf_minor + t.pf_major;
+    c.minor_faults_total += t.pf_minor;
+    c.major_faults_total += t.pf_major;
     c.lock_waits_total += t.lock_waits;
-    if (members.count(tid)) c.per_tid.push_back(t);
-  });
+    c.per_tid.push_back(t);
+  }
   std::sort(c.per_tid.begin(), c.per_tid.end(),
             [](const auto& a, const auto& b) { return a.on_cpu_ns > b.on_cpu_ns; });
   return c;
@@ -155,7 +162,7 @@ void DumpMemEvents(EbpfManager& ebpf, OutputWriter& writer, uint64_t ts_ns) {
       m.nr_reclaimed == last.nr_reclaimed)
     return;
   last = m;
-  nlohmann::json e = {{"v", 1}, {"ts_ns", ts_ns}, {"kswapd_active", m.kswapd_active},
+  nlohmann::json e = {{"v", 2}, {"ts_ns", ts_ns}, {"kswapd_active", m.kswapd_active},
                       {"direct_reclaim", m.direct_reclaim}, {"nr_reclaimed", m.nr_reclaimed}};
   writer.WriteMemoryEvent(e);
 }
@@ -173,30 +180,19 @@ void DumpOomEvents(EbpfManager& ebpf, OutputWriter& writer) {
     OomEventVal ev = {};
     if (!ebpf.Slice("oom_events")->Lookup(&ix, &ev)) continue;
     std::string comm = HostMetrics::ReadComm(ev.pid);
-    nlohmann::json e = {{"v", 1}, {"ts_ns", ev.ts}, {"pid", ev.pid}, {"comm", comm}};
+    nlohmann::json e = {{"v", 2}, {"ts_ns", ev.ts}, {"pid", ev.pid}, {"comm", comm}};
     writer.WriteMemoryEvent(e);
   }
   last_seq = seq;
 }
 
-void DumpIoDevices(EbpfManager& ebpf, OutputWriter& writer, uint64_t ts_ns) {
-  ebpf.Slice("dev_io")->ForEach([&](const void* key, const void* value) {
-    u32 dev = *(const u32*)key;
-    const auto* bi = (const BlockIoVal*)value;
-    nlohmann::json hist = nlohmann::json::array();
-    for (int i = 0; i < 13; ++i) hist.push_back(bi->hist[i]);
-    nlohmann::json e = {{"v", 1}, {"ts_ns", ts_ns}, {"dev", dev}, {"ops", bi->ops},
-                        {"bytes", bi->bytes}, {"lat_sum", bi->lat_sum}, {"hist", hist}};
-    writer.WriteIoDevice(e);
-  });
-}
-
 // One aggregated ProcessRow per selected process (the canonical top-K process
-// table), summed from the host process table's per-thread rows.
-std::vector<ProcessRow> BuildTopTasks(const HostSnapshot& host,
+// table), summed from the host process table's per-thread rows. RSS values
+// are REUSED from the already-read rows (no second /proc read).
+std::vector<ProcessRow> BuildTopTasks(const std::vector<ProcessRow>& table,
                                       const std::unordered_set<uint32_t>& procs) {
   std::unordered_map<uint32_t, ProcessRow> agg;
-  for (const auto& r : host.procs) {
+  for (const auto& r : table) {
     uint32_t g = r.tgid ? r.tgid : r.pid;
     if (!procs.count(g)) continue;
     ProcessRow& a = agg[g];
@@ -205,6 +201,8 @@ std::vector<ProcessRow> BuildTopTasks(const HostSnapshot& host,
       a.pid = g;
       a.state = r.state;
       a.start_time = r.start_time;
+      a.rss_valid = r.rss_valid;
+      a.rss_kb = r.rss_kb;
     }
     if (r.pid == g) {  // main thread: keep its comm
       std::memcpy(a.comm, r.comm, 15);
@@ -214,14 +212,13 @@ std::vector<ProcessRow> BuildTopTasks(const HostSnapshot& host,
     a.stime += r.stime;
     a.nvcsw += r.nvcsw;
     a.nivcsw += r.nivcsw;
+    a.minflt += r.minflt;
+    a.majflt += r.majflt;
     a.total_vm += r.total_vm;
   }
   std::vector<ProcessRow> out;
   out.reserve(agg.size());
-  for (auto& [g, a] : agg) {
-    a.rss_kb = HostMetrics::ReadVmRss(g);
-    out.push_back(a);
-  }
+  for (auto& [g, a] : agg) out.push_back(a);
   std::sort(out.begin(), out.end(), [](const ProcessRow& a, const ProcessRow& b) {
     return (a.utime + a.stime) > (b.utime + b.stime);
   });
@@ -229,12 +226,18 @@ std::vector<ProcessRow> BuildTopTasks(const HostSnapshot& host,
 }
 
 AnomalyFeatures BuildFeatures(const Config& cfg, uint64_t seq, const HostSnapshot& host,
-                              EbpfManager& ebpf, const std::unordered_set<uint32_t>& members,
-                              const std::unordered_set<uint32_t>& procs) {
+                              const NetworkSnapshot& network, const GpuSnapshot& gpu,
+                              const CgroupSnapshot& cgroup, EbpfManager& ebpf,
+                              const std::unordered_set<uint32_t>& members,
+                              const std::unordered_set<uint32_t>& procs,
+                              const std::vector<ProcessRow>& process_table) {
   AnomalyFeatures f;
   f.seq = seq;
   f.ts_ns = host.ts_ns;
   f.host = host;
+  f.network = network;
+  f.gpu = gpu;
+  f.cgroup = cgroup;
 
   // Focus filter (debug/benchmark): restrict host procs to one pid.
   if (cfg.misc.pid_filter) {
@@ -245,14 +248,14 @@ AnomalyFeatures BuildFeatures(const Config& cfg, uint64_t seq, const HostSnapsho
         f.host.procs.end());
   }
 
-  f.ebpf = BuildEbpfCounters(ebpf, host.ts_ns, members);
+  f.ebpf = BuildEbpfCounters(ebpf, host.ts_ns, members, process_table);
 
   std::unordered_set<uint32_t> want = procs;
   if (cfg.misc.pid_filter) {
     want.clear();
     want.insert((uint32_t)cfg.misc.pid_filter);
   }
-  f.top_tasks = BuildTopTasks(host, want);
+  f.top_tasks = BuildTopTasks(process_table, want);
   return f;
 }
 
@@ -299,7 +302,27 @@ int RunCollector(const Config& initial, const std::string& config_path, uint64_t
             bpf_stats_prev.empty() ? "unknown" : bpf_stats_prev.c_str());
   }
 
+  // Optional programs are compile-time present in the skeleton but may miss
+  // their kernel feature; autoload-off keeps a missing optional hook from
+  // failing the whole skeleton load. Required always-on programs stay on.
   EbpfManager ebpf;
+  if (!ebpf.Open()) {
+    LogError("BPF skeleton open failed");
+    return 1;
+  }
+  {
+    // Programs the 5.15 verifier rejects at LOAD time are autoload-off; the
+    // metrics they cover fall back to alternate instrumentation:
+    //   file I/O  -> kprobe/kretprobe vfs_read/vfs_write fallback programs
+    //   connect/accept/RTT -> raw-syscall enter/exit (already target-gated)
+    std::vector<std::string> unavailable;
+    ebpf.SetOptionalAutoload(
+        {"fentry_vfs_read", "fexit_vfs_read", "fentry_vfs_write", "fexit_vfs_write",
+         "kprobe_tcp_v4_connect", "kprobe_tcp_v6_connect",
+         "kretprobe_inet_csk_accept", "kprobe_tcp_rcv_established"},
+        &unavailable);
+    for (const auto& u : unavailable) LogWarn("optional hook unavailable: %s", u.c_str());
+  }
   if (!ebpf.Load()) {
     LogError("BPF load failed (kernel >= 6.6 with CONFIG_DEBUG_INFO_BTF required)");
     return 1;
@@ -307,27 +330,35 @@ int RunCollector(const Config& initial, const std::string& config_path, uint64_t
 
   // Push sampling config into the kernel + start the flight recorder.
   ebpf.WriteNcpus(PossibleCpus());
-  ebpf.WriteSampleRateCfg(cfg->sample.offcpu_sample_rate, cfg->sample.iofile_sample_rate);
+  ebpf.WriteSampleRateCfg(cfg->sample.offcpu_sample_rate, cfg->sample.iofile_sample_rate,
+                          cfg->devices.net_event_sample_rate);
   if (!ebpf.StartSnapshotter(cfg->sample.fine_interval_ms)) {
     LogError("failed to start the flight-recorder snapshotter");
     return 1;
   }
+
+  GpuMetrics gpu;
+  gpu.Init(cfg->devices.gpu_source);
 
   TargetSelector selector(ebpf, writer);
   selector.ApplyPinned(*cfg);
   selector.Probe(*cfg);
 
   auto model = MakeModelClient(*cfg);
-  DeepCollector deep(ebpf, writer);
+  DeepCollector deep(ebpf, writer, gpu);
   PhaseManager phase(writer, deep, std::move(model));
 
   uint64_t t0 = NowNs();
-  uint64_t next_host = 0, next_feature = 0, next_topk = 0, next_deep = 0;
+  uint64_t next_host = 0, next_feature = 0, next_topk = 0;
   uint64_t seq = 0;
   uint64_t next_overhead = 0;
   uint64_t last_overhead_ts = 0;
   uint64_t cur_interval_ms = cfg->sample.fine_interval_ms;
   HostSnapshot last_host;
+  NetworkSnapshot last_network;
+  GpuSnapshot last_gpu;
+  CgroupSnapshot last_cgroup;
+  std::vector<ProcessRow> process_table;
 
   while (!sig.stop.load()) {
     if (run_seconds &&
@@ -335,8 +366,14 @@ int RunCollector(const Config& initial, const std::string& config_path, uint64_t
       break;
 
     if (sig.reload.exchange(false)) {
+      std::string old_gpu_source = cfg->devices.gpu_source;
       cfg = ReloadConfig(initial, config_path);
-      ebpf.WriteSampleRateCfg(cfg->sample.offcpu_sample_rate, cfg->sample.iofile_sample_rate);
+      ebpf.WriteSampleRateCfg(cfg->sample.offcpu_sample_rate, cfg->sample.iofile_sample_rate,
+                              cfg->devices.net_event_sample_rate);
+      if (cfg->devices.gpu_source != old_gpu_source) {
+        gpu.Close();
+        gpu.Init(cfg->devices.gpu_source);
+      }
       selector.Probe(*cfg);
       LogInfo("config reloaded (fine_interval_ms=%llu)",
               (unsigned long long)cfg->sample.fine_interval_ms);
@@ -346,21 +383,25 @@ int RunCollector(const Config& initial, const std::string& config_path, uint64_t
 
     if (now >= next_host) {
       last_host = HostMetrics::Snapshot();
-      // Process table from iter/task, capped to the top-CPU tasks (the full
-      // table is huge at 1s resolution and adds no signal).
-      std::vector<ProcessRow> procs;
-      if (ebpf.ReadProcessTable(procs)) {
-        std::sort(procs.begin(), procs.end(), [](const ProcessRow& a, const ProcessRow& b) {
+      // One iterator pass per host tick: full table to the selector and
+      // BuildFeatures; only a top-200 CPU-sorted COPY goes into host.procs.
+      if (ebpf.ReadProcessTable(process_table)) {
+        // RSS and the fine-grained fields come from the iter/task eBPF pass
+        // itself (rss_stat/ioac/schedstat) — no per-thread /proc reads.
+        std::vector<ProcessRow> top = process_table;
+        std::sort(top.begin(), top.end(), [](const ProcessRow& a, const ProcessRow& b) {
           return (a.utime + a.stime) > (b.utime + b.stime);
         });
-        if (procs.size() > 200) procs.resize(200);
-        last_host.procs = std::move(procs);
+        if (top.size() > 200) top.resize(200);
+        last_host.procs = std::move(top);
       }
+      last_network = NetworkMetrics::Snapshot(last_host.ts_ns, cfg->devices.network_enabled);
+      last_gpu = gpu.Snapshot(last_host.ts_ns);
+      last_cgroup = HostMetrics::ReadCgroup(last_host.ts_ns);
       writer.BeginBatch();
-      writer.WriteHostRow(last_host);
+      writer.WriteHostRow(last_host, last_network, last_gpu, last_cgroup);
       DumpMemEvents(ebpf, writer, last_host.ts_ns);
       DumpOomEvents(ebpf, writer);
-      DumpIoDevices(ebpf, writer, last_host.ts_ns);
       writer.CommitBatch();
       next_host = now + cfg->sample.base_host_interval_ms * 1000000ULL;
     }
@@ -382,9 +423,14 @@ int RunCollector(const Config& initial, const std::string& config_path, uint64_t
       next_overhead = now + cfg->sample.overhead_interval_ms * 1000000ULL;
     }
 
+    // Target set + latest process table refresh BEFORE phase transitions.
+    deep.SetTargetProcesses(selector.member_threads());
+    deep.SetProcessTable(process_table);
+
     if (now >= next_feature) {
-      AnomalyFeatures f = BuildFeatures(*cfg, seq++, last_host, ebpf,
-                                        selector.member_threads(), selector.member_processes());
+      AnomalyFeatures f = BuildFeatures(*cfg, seq++, last_host, last_network, last_gpu,
+                                        last_cgroup, ebpf, selector.member_threads(),
+                                        selector.member_processes(), process_table);
       nlohmann::json j;
       to_json(j, f);
       writer.BeginBatch();
@@ -394,14 +440,13 @@ int RunCollector(const Config& initial, const std::string& config_path, uint64_t
       next_feature = now + cfg->sample.base_feature_interval_ms * 1000000ULL;
     }
     if (now >= next_topk) {
-      selector.Evaluate(*cfg);
+      if (!process_table.empty()) selector.Evaluate(*cfg, process_table, now);
       next_topk = now + cfg->targets.eval_interval_ms * 1000000ULL;
     }
 
-    if (phase.deep_active() && now >= next_deep) {
-      deep.Tick();
-      next_deep = now + cfg->sample.deep_dump_interval_ms * 1000000ULL;
-    }
+    // DEEP periodic duties are self-paced inside Tick (ring/process drain at
+    // deep_dump_interval_ms, GPU at deep_gpu_interval_ms).
+    deep.Tick(now, *cfg);
     phase.TickDeep(*cfg, now);
 
     // Manual phase switching (SIGUSR1/SIGUSR2) — anomaly-free DEEP benchmarking.
@@ -422,6 +467,7 @@ int RunCollector(const Config& initial, const std::string& config_path, uint64_t
 
   phase.Shutdown(*cfg, NowNs());
   ebpf.StopSnapshotter();
+  gpu.Close();
   ebpf.Close();
   writer.Close();  // WAL checkpoint + 关闭，主文件自含（前端 sql.js 只读主文件）
   RestoreBpfStats(bpf_stats_prev);

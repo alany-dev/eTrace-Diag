@@ -84,6 +84,12 @@ void Sanitize(Config& cfg) {
   cfg.targets.leave_rank = ClampU32(cfg.targets.leave_rank, cfg.targets.enter_rank, 4096);
   cfg.targets.hold_periods = ClampU32(cfg.targets.hold_periods, 1, 1000);
   cfg.targets.min_residency_seconds = ClampU64(cfg.targets.min_residency_seconds, 0, 36000);
+  cfg.devices.deep_gpu_interval_ms = ClampU64(cfg.devices.deep_gpu_interval_ms, 10, 5000);
+  cfg.devices.net_event_sample_rate = ClampU32(cfg.devices.net_event_sample_rate, 1, 100000);
+  if (cfg.devices.gpu_source != "auto" && cfg.devices.gpu_source != "off" &&
+      cfg.devices.gpu_source != "nvml" && cfg.devices.gpu_source != "drm") {
+    cfg.devices.gpu_source = "auto";
+  }
 
   if (cfg.model.adapter != "ws" && cfg.model.adapter != "onnx") cfg.model.adapter = "ws";
   cfg.output.dir = cfg.output.dir.empty() ? "out" : cfg.output.dir;
@@ -138,7 +144,14 @@ void to_json(nlohmann::json& j, const Config& c) {
        {{"log_level", c.misc.log_level},
         {"categories", c.misc.categories},
         {"pid_filter", c.misc.pid_filter},
-        {"enable_bpf_stats", c.misc.enable_bpf_stats}}}};
+        {"enable_bpf_stats", c.misc.enable_bpf_stats}}},
+      {"devices",
+       {{"network_enabled", c.devices.network_enabled},
+        {"deep_network_enabled", c.devices.deep_network_enabled},
+        {"gpu_source", c.devices.gpu_source},
+        {"deep_gpu_enabled", c.devices.deep_gpu_enabled},
+        {"deep_gpu_interval_ms", c.devices.deep_gpu_interval_ms},
+        {"net_event_sample_rate", c.devices.net_event_sample_rate}}}};
 }
 
 void from_json(const nlohmann::json& j, Config& c) {
@@ -196,6 +209,15 @@ void from_json(const nlohmann::json& j, Config& c) {
       if (m["causal"].contains("timeout_ms")) c.model.causal_timeout_ms = m["causal"]["timeout_ms"];
     }
     if (m.contains("adapter")) c.model.adapter = m["adapter"];
+  }
+  if (j.contains("devices")) {
+    auto& d = j["devices"];
+    if (d.contains("network_enabled")) c.devices.network_enabled = d["network_enabled"];
+    if (d.contains("deep_network_enabled")) c.devices.deep_network_enabled = d["deep_network_enabled"];
+    if (d.contains("gpu_source")) c.devices.gpu_source = d["gpu_source"];
+    if (d.contains("deep_gpu_enabled")) c.devices.deep_gpu_enabled = d["deep_gpu_enabled"];
+    if (d.contains("deep_gpu_interval_ms")) c.devices.deep_gpu_interval_ms = d["deep_gpu_interval_ms"];
+    if (d.contains("net_event_sample_rate")) c.devices.net_event_sample_rate = d["net_event_sample_rate"];
   }
   if (j.contains("output")) {
     auto& o = j["output"];
@@ -294,6 +316,18 @@ bool ApplyEnvOverrides(Config& c) {
        [](Config& x, const std::string& v) { x.targets.weights.fault = ParseD(v, x.targets.weights.fault); }},
       {"ETRACE_DIAG_TARGETS_WEIGHT_LOCK",
        [](Config& x, const std::string& v) { x.targets.weights.lock = ParseD(v, x.targets.weights.lock); }},
+      {"ETRACE_DIAG_DEVICES_NETWORK_ENABLED",
+       [](Config& x, const std::string& v) { x.devices.network_enabled = ParseBool(v, x.devices.network_enabled); }},
+      {"ETRACE_DIAG_DEVICES_DEEP_NETWORK_ENABLED",
+       [](Config& x, const std::string& v) { x.devices.deep_network_enabled = ParseBool(v, x.devices.deep_network_enabled); }},
+      {"ETRACE_DIAG_DEVICES_GPU_SOURCE",
+       [](Config& x, const std::string& v) { x.devices.gpu_source = v; }},
+      {"ETRACE_DIAG_DEVICES_DEEP_GPU_ENABLED",
+       [](Config& x, const std::string& v) { x.devices.deep_gpu_enabled = ParseBool(v, x.devices.deep_gpu_enabled); }},
+      {"ETRACE_DIAG_DEVICES_DEEP_GPU_INTERVAL_MS",
+       [](Config& x, const std::string& v) { x.devices.deep_gpu_interval_ms = ParseU64(v, x.devices.deep_gpu_interval_ms); }},
+      {"ETRACE_DIAG_DEVICES_NET_EVENT_SAMPLE_RATE",
+       [](Config& x, const std::string& v) { x.devices.net_event_sample_rate = (uint32_t)ParseU64(v, x.devices.net_event_sample_rate); }},
 
       {"ETRACE_DIAG_MODEL_ANOMALY_URL",
        [](Config& x, const std::string& v) { x.model.anomaly_url = v; }},

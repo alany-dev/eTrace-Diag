@@ -152,3 +152,18 @@ target_include_directories(config_probe PRIVATE
 target_compile_options(config_probe PRIVATE -O2 -Wall -Werror)
 add_test(NAME config_probe COMMAND config_probe
   ${CMAKE_CURRENT_SOURCE_DIR}/config/default.json)
+
+# Root-free schema/serialization proof: generates a v2 session DB through the
+# real OutputWriter API; tools/viz/test/smoke.mjs and dom.mjs consume it.
+add_executable(viz_fixture
+  ${CMAKE_CURRENT_SOURCE_DIR}/tools/viz/test/gen_fixture.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/output/writer.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/metrics.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/config.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/logging.cpp)
+target_include_directories(viz_fixture PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
+target_compile_options(viz_fixture PRIVATE -O2 -Wall -Werror)
+target_link_libraries(viz_fixture PRIVATE Threads::Threads SQLite::SQLite3)

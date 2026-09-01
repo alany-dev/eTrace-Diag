@@ -61,6 +61,24 @@ struct bpf_timer {
 
 // REQ_OP_MASK is a preprocessor define (not in BTF): REQ_OP_BITS == 8.
 #define REQ_OP_MASK 0xff
+#ifndef NR_MM_COUNTERS
+#define NR_MM_COUNTERS 4
+#endif
+
+// AF_* and TCP_* are preprocessor defines/enums absent from vmlinux.h BTF.
+#define AF_INET 2
+#define AF_INET6 10
+#define TCP_ESTABLISHED 1
+#define TCP_SYN_SENT 2
+#define TCP_SYN_RECV 3
+#define TCP_FIN_WAIT1 4
+#define TCP_FIN_WAIT2 5
+#define TCP_TIME_WAIT 6
+#define TCP_CLOSE 7
+#define TCP_CLOSE_WAIT 8
+#define TCP_LAST_ACK 9
+#define TCP_LISTEN 10
+#define TCP_CLOSING 11
 
 // ===========================================================================
 // Shared value types
@@ -100,19 +118,42 @@ struct blk_req_t {
 };
 
 struct wakeup_t { u64 ts; };
-struct offcpu_stash_t { u64 out_ts; u32 ksid; };
-struct sys_start_t { u32 id; u64 ts; u32 user_sid; u8 futex_wait; };
+struct offcpu_stash_t { u64 out_ts; u32 ksid; u32 stack_available; };
+struct sys_start_t { u32 id; u64 ts; u8 futex_wait; };
 struct lock_wait_t { u64 lock_addr; u64 ts; u32 flags; };
+struct io_start_t { u32 dev; u64 ino; char path[256]; u64 ts; };
+
+// DEEP network value types
+struct sock_owner_t {
+  u64 tgid;
+  u32 tid;
+  u64 netns_ino;
+  u32 family;
+  u32 local_addr[4];    // v4 in [0]; v6 across all four
+  u32 remote_addr[4];
+  u32 local_port;       // network byte order
+  u32 remote_port;
+  u64 start_ts;
+  u64 established_ts;
+  u64 tx_bytes;
+  u64 rx_bytes;
+  u64 retrans;
+  u32 rst_reason;
+  u64 rtt_count;
+  u64 rtt_sum_us;       // srtt samples summed (us)
+};
+struct connect_start_t { u64 cookie; u64 ts; };
+struct net_drop_key { u64 netns_ino; u32 ifindex; u32 reason_id; };
+struct net_softirq_key { u32 cpu_idx; u32 vector; };
+struct flow_key { u64 cookie; };
 
 // DEEP result keys/values
 struct sys_lat_key { u32 tid; u32 id; };
-struct sys_lat_val { u64 count; u64 lat_sum; u32 hist[HIST64_BINS]; };
-struct syscall_caller_key { u32 id; u32 user_sid; };
+struct sys_lat_val { u64 count; u64 lat_sum; u64 error_count; u32 hist[HIST64_BINS]; };
 struct oncpu_key { u32 pid; u32 tid; u32 user_sid; u32 kernel_sid; };
 struct offcpu_key { u32 tid; u32 ksid; };
 struct io_file_key { u32 dev; u64 ino; char path[256]; };
-struct io_file_val { u64 bytes; u32 ops; };
-struct open_path_key { u32 dev; u64 ino; };
+struct io_file_val { u64 bytes; u32 ops; u64 errors; u64 lat_sum; u32 hist[HIST13_BINS]; };
 struct lock_hot_val { u64 count; u64 lat_sum; };
 
 struct mem_events_t { u32 kswapd_active; u32 direct_reclaim; u64 nr_reclaimed; };
@@ -120,7 +161,7 @@ struct oom_event_t { u64 ts; u32 pid; };
 struct ratelimit_t { u64 last_ts[4]; };
 struct timer_val { struct bpf_timer t; };
 struct arm_cmd_val { u64 interval_ns; u64 cancel; };
-struct sample_rate_cfg { u32 offcpu_rate; u32 iofile_thresh; };
+struct sample_rate_cfg { u32 offcpu_rate; u32 iofile_thresh; u32 net_rate; };
 
 // ===========================================================================
 // Maps (names frozen)
@@ -203,17 +244,40 @@ struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 4096);
 struct { __uint(type, BPF_MAP_TYPE_PERCPU_HASH); __uint(max_entries, 16384);
          __type(key, struct sys_lat_key); __type(value, struct sys_lat_val); } sys_lat SEC(".maps");
 struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 16384);
-         __type(key, struct syscall_caller_key); __type(value, u64); } syscall_caller SEC(".maps");
-struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 16384);
          __type(key, struct oncpu_key); __type(value, u64); } oncpu_count SEC(".maps");
 struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 8192);
          __type(key, struct offcpu_key); __type(value, u64); } offcpu_time SEC(".maps");
 struct { __uint(type, BPF_MAP_TYPE_PERCPU_HASH); __uint(max_entries, 16384);
          __type(key, struct io_file_key); __type(value, struct io_file_val); } io_file SEC(".maps");
-struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 8192);
-         __type(key, struct open_path_key); __type(value, char[256]); } open_path SEC(".maps");
+struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 4096);
+         __type(key, u32); __type(value, struct io_start_t); } io_start SEC(".maps");
 struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 4096);
          __type(key, u64); __type(value, struct lock_hot_val); } lock_hot SEC(".maps");
+// Stackless off-CPU dwell aggregated per tid (dumped as deep_offcpu).
+struct { __uint(type, BPF_MAP_TYPE_PERCPU_HASH); __uint(max_entries, 4096);
+         __type(key, u32); __type(value, struct lat_stat); } offcpu_stat SEC(".maps");
+struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 4096);
+         __type(key, u32); __type(value, u64); } offcpu_last_ts SEC(".maps");
+// Set by the host when offcpu_schedule (kprobe/__schedule) is unavailable:
+// on_switch then records stackless off-CPU dwell (stack_available=0).
+struct { __uint(type, BPF_MAP_TYPE_ARRAY); __uint(max_entries, 1);
+         __type(key, u32); __type(value, u32); } offcpu_fallback SEC(".maps");
+
+// DEEP network maps (all max_entries per the frozen contract)
+struct { __uint(type, BPF_MAP_TYPE_LRU_HASH); __uint(max_entries, 16384);
+         __type(key, u64); __type(value, struct sock_owner_t); } sock_owner SEC(".maps");
+struct { __uint(type, BPF_MAP_TYPE_LRU_HASH); __uint(max_entries, 16384);
+         __type(key, u64); __type(value, struct sock_owner_t); } net_flow SEC(".maps");
+struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 4096);
+         __type(key, u32); __type(value, struct connect_start_t); } connect_start SEC(".maps");
+struct { __uint(type, BPF_MAP_TYPE_PERCPU_HASH); __uint(max_entries, 4096);
+         __type(key, struct net_drop_key); __type(value, u64); } net_drop SEC(".maps");
+struct { __uint(type, BPF_MAP_TYPE_PERCPU_HASH); __uint(max_entries, 1024);
+         __type(key, struct net_softirq_key); __type(value, struct lat_stat); } net_softirq SEC(".maps");
+struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 16384);
+         __type(key, u64); __type(value, u64); } rtt_last SEC(".maps");
+struct { __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY); __uint(max_entries, 1);
+         __type(key, u32); __type(value, u64); } softirq_enter_ts SEC(".maps");
 
 // Stacks: STACK_TRACE, value = u64 ip[127]
 struct { __uint(type, BPF_MAP_TYPE_STACK_TRACE); __uint(max_entries, 16384);
@@ -332,8 +396,8 @@ int BPF_PROG(on_switch, bool preempt, struct task_struct *prev, struct task_stru
   u32 prev_tid = curp ? *curp : 0;
   u64 start = lastp ? *lastp : 0;
 
-  // 1. attribute on-CPU time of the outgoing (previous) tid.
-  if (prev_tid && start && now > start) {
+  // 1. attribute on-CPU time of the outgoing (previous) tid — targets only.
+  if (prev_tid && start && now > start && tid_is_target(prev_tid)) {
     u64 delta = now - start;
     u64 *v = h_u64(&on_cpu_ns, &prev_tid);
     if (v) *v += delta;
@@ -345,8 +409,8 @@ int BPF_PROG(on_switch, bool preempt, struct task_struct *prev, struct task_stru
 
   u32 prev_pid = BPF_CORE_READ(prev, pid);
 
-  // 2. switch counting + deep off-CPU branch (skip idle task).
-  if (prev_pid != 0) {
+  // 2. switch counting — targets only (idle task skipped).
+  if (prev_pid != 0 && tid_is_target(prev_pid)) {
     unsigned int prev_state = BPF_CORE_READ(prev, __state);
     struct switch_t *sw = h_sw(&switches, &prev_pid);
     if (prev_state == 0) {
@@ -354,35 +418,47 @@ int BPF_PROG(on_switch, bool preempt, struct task_struct *prev, struct task_stru
     } else if (prev_state & 0x7F) {
       if (sw) sw->vol++;          // blocked (sleep/stop)
     }
+  }
 
-    // deep off-CPU: stash on real blocking sleep for target tids.
-    if (deep_mode() && (prev_state != 0) && !(prev_state & 0x100) && !(prev_state & 0x80) &&
-        (prev_state & 0x7F) && tid_is_target(prev_pid)) {
-      struct ratelimit_t *rl = bpf_map_lookup_elem(&ratelimit, &zero);
-      struct sample_rate_cfg *rc = bpf_map_lookup_elem(&sample_rate_cfg, &zero);
-      u32 rate = rc ? rc->offcpu_rate : 0;
-      u64 elapsed = (rl && now > rl->last_ts[0]) ? (now - rl->last_ts[0]) : 0;
-      if (rl && rate && (rl->last_ts[0] == 0 || elapsed * (u64)rate >= 1000000000ULL)) {
-        // tp_btf raw-tp has no pt_regs, so bpf_get_stackid cannot capture the
-        // kernel stack here (it needs a kprobe/perf ctx); still record the
-        // off-CPU dwell time, keyed under stack id 0.
-        struct offcpu_stash_t st = {};
-        st.out_ts = now;
-        st.ksid = 0;
-        bpf_map_update_elem(&offcpu_stash, &prev_pid, &st, BPF_ANY);
-        if (rl) rl->last_ts[0] = now;
+  // 2b. stackless off-CPU fallback stash (kprobe/__schedule unavailable):
+  //     dwell-only samples land in offcpu_stat -> deep_offcpu.
+  if (deep_mode() && prev_pid != 0 && tid_is_target(prev_pid)) {
+    unsigned int pv_state = BPF_CORE_READ(prev, __state);
+    if ((pv_state != 0) && !(pv_state & 0x100) && !(pv_state & 0x80) && (pv_state & 0x7F)) {
+      u32 *fb = bpf_map_lookup_elem(&offcpu_fallback, &zero);
+      if (fb && *fb) {
+        u64 *last = bpf_map_lookup_elem(&offcpu_last_ts, &prev_pid);
+        struct sample_rate_cfg *rc = bpf_map_lookup_elem(&sample_rate_cfg, &zero);
+        u32 rate = rc ? rc->offcpu_rate : 0;
+        u64 elapsed = (last && now > *last) ? (now - *last) : 0;
+        if (last && rate && (*last == 0 || elapsed * (u64)rate >= 1000000000ULL)) {
+          struct offcpu_stash_t st = {};
+          st.out_ts = now;
+          st.ksid = 0;
+          st.stack_available = 0;
+          bpf_map_update_elem(&offcpu_stash, &prev_pid, &st, BPF_ANY);
+          *last = now;
+        }
       }
     }
   }
 
-  // 3. deep on-CPU-turned-off-CPU completion + runq latency on switch-in.
+  // 3. off-CPU completion + runq latency on switch-in.
   if (deep_mode() && tid_is_target(next_pid)) {
     struct offcpu_stash_t *st = bpf_map_lookup_elem(&offcpu_stash, &next_pid);
     if (st) {
       u64 dwell = now - st->out_ts;
-      struct offcpu_key k = {.tid = next_pid, .ksid = st->ksid};
-      u64 *t = h_u64(&offcpu_time, &k);
-      if (t) *t += dwell;
+      if (st->stack_available) {
+        // Stacked sample: fold under its kernel stack id (ksid==0 still
+        // recorded — deep_folded handles it; caller marks stack_available).
+        struct offcpu_key k = {.tid = next_pid, .ksid = st->ksid};
+        u64 *t = h_u64(&offcpu_time, &k);
+        if (t) *t += dwell;
+      } else {
+        // Stackless sample: per-tid aggregation for deep_offcpu.
+        struct lat_stat *o = h_lat(&offcpu_stat, &next_pid);
+        if (o) { o->count++; o->lat_sum += dwell; add_hist13(o->hist, dwell); }
+      }
       bpf_map_delete_elem(&offcpu_stash, &next_pid);
     }
     u64 *w = bpf_map_lookup_elem(&wakeup_ts, &next_pid);
@@ -404,7 +480,8 @@ static __always_inline void record_wakeup(struct task_struct *p) {
   u32 pid = BPF_CORE_READ(p, pid);
   if (!deep_mode() || !tid_is_target(pid)) return;
   u64 now = bpf_ktime_get_ns();
-  bpf_map_update_elem(&wakeup_ts, &pid, &now, BPF_ANY);
+  // BPF_NOEXIST keeps the EARLIEST uncompleted wakeup; on_switch deletes it.
+  bpf_map_update_elem(&wakeup_ts, &pid, &now, BPF_NOEXIST);
 }
 
 SEC("tp_btf/sched_wakeup")
@@ -416,6 +493,53 @@ int BPF_PROG(on_wakeup, struct task_struct *p) {
 SEC("tp_btf/sched_wakeup_new")
 int BPF_PROG(on_wakeup_new, struct task_struct *p) {
   record_wakeup(p);
+  return 0;
+}
+
+// ===========================================================================
+// DEEP optional: kprobe/__schedule off-CPU stack capture. bpf_get_stackid is
+// legal in kprobe context (unlike tp_btf). Rate-limited per tid; on_switch
+// completes the dwell pairing on switch-in.
+// ===========================================================================
+SEC("kprobe/__schedule")
+int BPF_KPROBE(offcpu_schedule) {
+  if (!deep_mode()) return 0;
+  u32 tid = (u32)bpf_get_current_pid_tgid();
+  if (!tid_is_target(tid)) return 0;
+
+  u64 now = bpf_ktime_get_ns();
+  u64 *last = bpf_map_lookup_elem(&offcpu_last_ts, &tid);
+  u32 zero = 0;
+  struct sample_rate_cfg *rc = bpf_map_lookup_elem(&sample_rate_cfg, &zero);
+  u32 rate = rc ? rc->offcpu_rate : 0;
+  u64 elapsed = (last && now > *last) ? (now - *last) : 0;
+  if (!last || !rate || (*last == 0 || elapsed * (u64)rate >= 1000000000ULL)) {
+    int ksid = bpf_get_stackid(ctx, &stackmap, BPF_F_FAST_STACK_CMP);
+    struct offcpu_stash_t st = {};
+    st.out_ts = now;
+    st.ksid = ksid >= 0 ? (u32)ksid : 0;
+    st.stack_available = ksid >= 0 ? 1 : 0;
+    bpf_map_update_elem(&offcpu_stash, &tid, &st, BPF_ANY);
+    if (last) *last = now;
+    else {
+      u64 z = now;
+      bpf_map_update_elem(&offcpu_last_ts, &tid, &z, BPF_ANY);
+    }
+  }
+  return 0;
+}
+
+// DEEP optional: cleanup for killed/exited tasks — stale wait timestamps would
+// produce bogus dwell/latency on tid reuse.
+SEC("tp_btf/sched_process_exit")
+int BPF_PROG(on_process_exit, struct task_struct *p) {
+  u32 tid = BPF_CORE_READ(p, pid);
+  bpf_map_delete_elem(&wakeup_ts, &tid);
+  bpf_map_delete_elem(&offcpu_stash, &tid);
+  bpf_map_delete_elem(&offcpu_last_ts, &tid);
+  bpf_map_delete_elem(&sys_start, &tid);
+  bpf_map_delete_elem(&io_start, &tid);
+  bpf_map_delete_elem(&connect_start, &tid);
   return 0;
 }
 
@@ -481,6 +605,7 @@ int BPF_PROG(on_rq_complete, struct request *rq, int error, unsigned int nr_byte
 SEC("kretprobe/handle_mm_fault")
 int BPF_KRETPROBE(fault_ret, long ret) {
   u32 tid = (u32)bpf_get_current_pid_tgid();
+  if (!tid_is_target(tid)) return 0;
   struct faults_t *f = h_flt(&faults, &tid);
   if (!f) return 0;
   if (ret & 0x4) f->major++;   // VM_FAULT_MAJOR == 0x4
@@ -634,16 +759,60 @@ int task_iter(struct bpf_iter__task *ctx) {
   u64 stime = BPF_CORE_READ(task, stime);
   u64 nvcsw = BPF_CORE_READ(task, nvcsw);
   u64 nivcsw = BPF_CORE_READ(task, nivcsw);
-  u64 total_vm = 0;
-  struct mm_struct *mm = BPF_CORE_READ(task, mm);
-  if (mm) total_vm = BPF_CORE_READ(mm, total_vm);
+  u64 min_flt = 0, maj_flt = 0;
+  if (bpf_core_field_exists(task->min_flt) && bpf_core_field_exists(task->maj_flt)) {
+    min_flt = BPF_CORE_READ(task, min_flt);
+    maj_flt = BPF_CORE_READ(task, maj_flt);
+  }
+  // ioac: rchar/wchar/syscr/syscw/read_bytes/write_bytes (cumulative)
+  u64 rchar = 0, wchar = 0, syscr = 0, syscw = 0, rd_bytes = 0, wr_bytes = 0;
+  if (bpf_core_field_exists(task->ioac)) {
+    rchar = BPF_CORE_READ(task, ioac.rchar);
+    wchar = BPF_CORE_READ(task, ioac.wchar);
+    syscr = BPF_CORE_READ(task, ioac.syscr);
+    syscw = BPF_CORE_READ(task, ioac.syscw);
+    rd_bytes = BPF_CORE_READ(task, ioac.read_bytes);
+    wr_bytes = BPF_CORE_READ(task, ioac.write_bytes);
+  }
+  // schedstat: se.sum_exec_runtime + sched_info.run_delay
+  u64 sum_exec = 0, run_delay = 0;
+  if (bpf_core_field_exists(task->se)) sum_exec = BPF_CORE_READ(task, se.sum_exec_runtime);
+  if (bpf_core_field_exists(task->sched_info)) run_delay = BPF_CORE_READ(task, sched_info.run_delay);
 
-  BPF_SEQ_PRINTF(seq, "%u %u %s %u %llu %llu %llu %llu %llu %llu\n",
+  u64 total_vm = 0, rss_anon = 0, rss_file = 0, rss_shmem = 0, swap_ents = 0;
+  struct mm_struct *mm = BPF_CORE_READ(task, mm);
+  if (mm) {
+    total_vm = BPF_CORE_READ(mm, total_vm);
+    if (bpf_core_field_exists(mm->rss_stat)) {
+      // rss_stat.count[] is atomic64_t on 5.15: copy the raw long value.
+      bpf_core_read(&rss_file, 8, &mm->rss_stat.count[MM_FILEPAGES]);
+      bpf_core_read(&rss_anon, 8, &mm->rss_stat.count[MM_ANONPAGES]);
+      bpf_core_read(&rss_shmem, 8, &mm->rss_stat.count[MM_SHMEMPAGES]);
+      // MM_SWAPENTS exists on every supported kernel (>=5.9); index 2 in
+      // both 5.15 and 6.6 BTF.
+      if (NR_MM_COUNTERS > 2)
+        bpf_core_read(&swap_ents, 8, &mm->rss_stat.count[2]);
+    }
+  }
+
+  // bpf_seq_printf caps at 12 varargs -> three prefixed lines per task.
+  BPF_SEQ_PRINTF(seq, "A %u %u %s %u %llu %llu %llu %llu %llu %llu %llu\n",
                  pid, tgid, comm, state,
                  (unsigned long long)start_time,
                  (unsigned long long)utime, (unsigned long long)stime,
                  (unsigned long long)nvcsw, (unsigned long long)nivcsw,
-                 (unsigned long long)total_vm);
+                 (unsigned long long)min_flt, (unsigned long long)maj_flt);
+  BPF_SEQ_PRINTF(seq, "B %u %llu %llu %llu %llu %llu %llu %llu %llu %llu\n",
+                 pid,
+                 (unsigned long long)total_vm,
+                 (unsigned long long)rchar, (unsigned long long)wchar,
+                 (unsigned long long)syscr, (unsigned long long)syscw,
+                 (unsigned long long)rd_bytes, (unsigned long long)wr_bytes,
+                 (unsigned long long)sum_exec, (unsigned long long)run_delay);
+  BPF_SEQ_PRINTF(seq, "C %u %llu %llu %llu %llu\n",
+                 pid,
+                 (unsigned long long)rss_anon, (unsigned long long)rss_file,
+                 (unsigned long long)rss_shmem, (unsigned long long)swap_ents);
   return 0;
 }
 
@@ -655,14 +824,73 @@ int task_iter(struct bpf_iter__task *ctx) {
 // The syscall arguments live in the (user) pt_regs; on x86_64 the syscall
 // calling convention is arg0=di, arg1=si, ..., arg5=r9.
 // ===========================================================================
+
+// ===========================================================================
+// DEEP: syscall latency — PRIMARY path fentry/fexit on do_syscall_64.
+// One entry + one exit point covers every syscall on x86_64; per-call cost is
+// an order of magnitude below the raw_syscalls tracepoint pair. Still
+// machine-fire + target early-return: any kernel tracing hook fires for the
+// whole machine, so the gate is a single pid check + hash lookup.
+// ===========================================================================
+static __always_inline void syslat_account(u32 tid, u32 id, u8 futex_wait, u64 lat, long ret) {
+  if (futex_wait) {
+    struct lat_stat *f = h_lat(&futex_st, &tid);
+    if (f) { f->count++; f->lat_sum += lat; add_hist13(f->hist, lat); }
+  } else {
+    struct sys_lat_key k = {.tid = tid, .id = id};
+    struct sys_lat_val *sv = h_sys(&sys_lat, &k);
+    if (sv) {
+      sv->count++;
+      sv->lat_sum += lat;
+      add_hist64(sv->hist, lat);
+      if (ret < 0) sv->error_count++;
+    }
+    struct lat_stat *st = h_lat(&sys_st, &tid);
+    if (st) { st->count++; st->lat_sum += lat; add_hist13(st->hist, lat); }
+  }
+}
+
+SEC("fentry/do_syscall_64")
+int BPF_PROG(fentry_sys, struct pt_regs *regs, unsigned int nr) {
+  if (!deep_mode()) return 0;
+  u32 tid = (u32)bpf_get_current_pid_tgid();
+  if (!tid_is_target(tid)) return 0;
+  u64 id = BPF_CORE_READ(regs, orig_ax);
+  u8 futex_wait = 0;
+  if (id == ETD_NR_FUTEX) {
+    unsigned long arg1 = BPF_CORE_READ(regs, si);  // x86_64: rsi = 2nd arg
+    u64 cmd = arg1 & FUTEX_CMD_MASK;
+    if (cmd == FUTEX_WAIT || cmd == FUTEX_WAIT_BITSET) futex_wait = 1;
+  }
+  struct sys_start_t st = {};
+  st.id = (u32)id;
+  st.ts = bpf_ktime_get_ns();
+  st.futex_wait = futex_wait;
+  bpf_map_update_elem(&sys_start, &tid, &st, BPF_ANY);
+  return 0;
+}
+
+SEC("fexit/do_syscall_64")
+int BPF_PROG(fexit_sys, struct pt_regs *regs, unsigned int nr) {
+  if (!deep_mode()) return 0;
+  u32 tid = (u32)bpf_get_current_pid_tgid();
+  if (!tid_is_target(tid)) return 0;
+  struct sys_start_t *st = bpf_map_lookup_elem(&sys_start, &tid);
+  if (!st) return 0;
+  u64 lat = bpf_ktime_get_ns() - st->ts;
+  long ret = (long)BPF_CORE_READ(regs, ax);
+  syslat_account(tid, st->id, st->futex_wait, lat, ret);
+  bpf_map_delete_elem(&sys_start, &tid);
+  return 0;
+}
+
+// ===========================================================================
+// DEEP: raw syscalls enter/exit (fallback for non-x86 or fentry-less kernels)
 SEC("tp_btf/sys_enter")
 int BPF_PROG(on_sys_enter, struct pt_regs *regs, long id) {
   if (id < 0) return 0;  // compat (ia32/x32)
   u32 tid = (u32)bpf_get_current_pid_tgid();
   if (!tid_is_target(tid)) return 0;
-
-  // raw-tp ctx has no user pt_regs stack => caller evidence degrades to 0.
-  u32 user_sid = 0;
 
   u8 futex_wait = 0;
   if (id == ETD_NR_FUTEX) {
@@ -679,7 +907,6 @@ int BPF_PROG(on_sys_enter, struct pt_regs *regs, long id) {
   struct sys_start_t s = {};
   s.id = (u32)id;
   s.ts = bpf_ktime_get_ns();
-  s.user_sid = user_sid;
   s.futex_wait = futex_wait;
   bpf_map_update_elem(&sys_start, &tid, &s, BPF_ANY);
   return 0;
@@ -687,31 +914,18 @@ int BPF_PROG(on_sys_enter, struct pt_regs *regs, long id) {
 
 SEC("tp_btf/sys_exit")
 int BPF_PROG(on_sys_exit, struct pt_regs *regs, long ret) {
+  (void)regs;
   u32 tid = (u32)bpf_get_current_pid_tgid();
   if (!tid_is_target(tid)) return 0;
   struct sys_start_t *s = bpf_map_lookup_elem(&sys_start, &tid);
   if (!s) return 0;
   u64 lat = bpf_ktime_get_ns() - s->ts;
 
-  if (s->futex_wait) {
-    struct lat_stat *f = h_lat(&futex_st, &tid);
-    if (f) { f->count++; f->lat_sum += lat; add_hist13(f->hist, lat); }
-  } else {
-    u32 id = s->id;
-    struct sys_lat_key k = {.tid = tid, .id = id};
-    struct sys_lat_val *sv = h_sys(&sys_lat, &k);
-    if (sv) { sv->count++; sv->lat_sum += lat; add_hist64(sv->hist, lat); }
-    struct syscall_caller_key ck = {.id = id, .user_sid = s->user_sid};
-    u64 *c = h_u64(&syscall_caller, &ck);
-    if (c) (*c)++;
-    struct lat_stat *st = h_lat(&sys_st, &tid);
-    if (st) { st->count++; st->lat_sum += lat; add_hist13(st->hist, lat); }
-  }
+  syslat_account(tid, s->id, s->futex_wait, lat, ret);
 
   bpf_map_delete_elem(&sys_start, &tid);
   return 0;
 }
-
 // ===========================================================================
 // DEEP: on-CPU profile (perf_event)
 // ===========================================================================
@@ -732,82 +946,425 @@ int oncpu(struct bpf_perf_event_data *ctx) {
 }
 
 // ===========================================================================
-// DEEP: hot-file I/O (kprobe/vfs_read, vfs_write) — sampled
+// DEEP: hot-file I/O (fentry/fexit vfs_read, vfs_write) — sampled entry,
+// measured exit. The entry saves dev/ino/path/ts only for sampled calls
+// (bpf_d_path is only invoked on the sampled subset); the exit accumulates
+// ACTUAL returned bytes (positive), errors (negative return) and latency.
 // ===========================================================================
-static __always_inline void record_file_io(struct file *f, u64 count) {
+static __always_inline bool iofile_sampled(void) {
+  u32 zero = 0;
+  struct sample_rate_cfg *rc = bpf_map_lookup_elem(&sample_rate_cfg, &zero);
+  u32 thresh = rc ? rc->iofile_thresh : 0;
+  if (thresh == 0) return false;
+  return bpf_get_prandom_u32() <= thresh;
+}
+
+static __always_inline void iofile_enter(struct file *f) {
   if (!deep_mode()) return;
   u32 tid = (u32)bpf_get_current_pid_tgid();
   if (!tid_is_target(tid)) return;
+  if (!iofile_sampled()) return;
 
-  u32 thresh_zero = 0;
-  struct sample_rate_cfg *rc = bpf_map_lookup_elem(&sample_rate_cfg, &thresh_zero);
-  u32 thresh = rc ? rc->iofile_thresh : 0;
-  if (thresh == 0) return;
-  if (bpf_get_prandom_u32() > thresh) return;
+  struct io_start_t st = {};
+  st.dev = (u32)BPF_CORE_READ(f, f_inode, i_sb, s_dev);
+  st.ino = BPF_CORE_READ(f, f_inode, i_ino);
+  st.ts = bpf_ktime_get_ns();
+  // Path capture only for the sampled call; failure leaves an empty path
+  // (dev/ino still identify the file).
+  long n = bpf_d_path(&f->f_path, st.path, sizeof(st.path));
+  if (n < 0) st.path[0] = 0;
+  bpf_map_update_elem(&io_start, &tid, &st, BPF_ANY);
+}
 
-  u32 dev = (u32)BPF_CORE_READ(f, f_inode, i_sb, s_dev);
-  u64 ino = BPF_CORE_READ(f, f_inode, i_ino);
+static __always_inline void iofile_exit(long ret) {
+  if (!deep_mode()) return;
+  u32 tid = (u32)bpf_get_current_pid_tgid();
+  if (!tid_is_target(tid)) return;
+  struct io_start_t *st = bpf_map_lookup_elem(&io_start, &tid);
+  if (!st) return;
+  u64 now = bpf_ktime_get_ns();
+  u64 lat = now > st->ts ? now - st->ts : 0;
 
   struct io_file_key k = {};
-  k.dev = dev; k.ino = ino;
-
-  // full path if we captured it at open time, else basename fallback
-  struct open_path_key opk = {};
-  opk.dev = dev;
-  opk.ino = ino;
-  char *path = bpf_map_lookup_elem(&open_path, &opk);
-  if (path && path[0]) {
-    bpf_probe_read_kernel_str(k.path, sizeof(k.path), path);
-  } else {
-    // basename fallback (when open_path missed the open event): read
-    // f_path.dentry -> d_name.name via CO-RE pointer hops.
-    struct path p;
-    if (bpf_core_read(&p, sizeof(p), &f->f_path) == 0 && p.dentry) {
-      struct qstr q;
-      if (bpf_core_read(&q, sizeof(q), &p.dentry->d_name) == 0)
-        bpf_probe_read_kernel_str(k.path, sizeof(k.path), q.name);
-    }
-  }
-
+  k.dev = st->dev;
+  k.ino = st->ino;
+  bpf_probe_read_kernel_str(k.path, sizeof(k.path), st->path);
   struct io_file_val *v = h_iof(&io_file, &k);
-  if (v) { v->bytes += count; v->ops++; }
+  if (v) {
+    if (ret > 0) {
+      v->bytes += (u64)ret;
+      v->ops++;
+    } else {
+      v->errors++;
+    }
+    v->lat_sum += lat;
+    add_hist13(v->hist, lat);
+  }
+  bpf_map_delete_elem(&io_start, &tid);
+}
+
+SEC("fentry/vfs_read")
+int BPF_PROG(fentry_vfs_read, struct file *f, char *buf, size_t count, loff_t *pos) {
+  (void)buf; (void)count; (void)pos;
+  iofile_enter(f);
+  return 0;
+}
+
+SEC("fexit/vfs_read")
+int BPF_PROG(fexit_vfs_read, struct file *f, char *buf, size_t count, loff_t *pos, long ret) {
+  (void)f; (void)buf; (void)count; (void)pos;
+  iofile_exit(ret);
+  return 0;
+}
+
+SEC("fentry/vfs_write")
+int BPF_PROG(fentry_vfs_write, struct file *f, const char *buf, size_t count, loff_t *pos) {
+  (void)buf; (void)count; (void)pos;
+  iofile_enter(f);
+  return 0;
+}
+
+SEC("fexit/vfs_write")
+int BPF_PROG(fexit_vfs_write, struct file *f, const char *buf, size_t count, loff_t *pos,
+             long ret) {
+  (void)f; (void)buf; (void)count; (void)pos;
+  iofile_exit(ret);
+  return 0;
+}
+
+// ---- fallback: kprobe/kretprobe vfs_read/vfs_write (kernels where the
+// verifier rejects the fentry/fexit pair at load, e.g. 5.15). Same sampling
+// and measured-exit semantics; bpf_d_path is not called here (empty path +
+// dev/ino identify the file). ----
+static __always_inline void iofile_enter_kprobe(struct file *f) {
+  if (!deep_mode()) return;
+  u32 tid = (u32)bpf_get_current_pid_tgid();
+  if (!tid_is_target(tid)) return;
+  if (!iofile_sampled()) return;
+  struct io_start_t st = {};
+  st.dev = (u32)BPF_CORE_READ(f, f_inode, i_sb, s_dev);
+  st.ino = BPF_CORE_READ(f, f_inode, i_ino);
+  st.ts = bpf_ktime_get_ns();
+  st.path[0] = 0;
+  bpf_map_update_elem(&io_start, &tid, &st, BPF_ANY);
 }
 
 SEC("kprobe/vfs_read")
-int BPF_KPROBE(do_vfs_read, struct file *f, char *buf, size_t count, loff_t *pos) {
-  (void)buf; (void)pos;
-  record_file_io(f, (u64)count);
+int BPF_KPROBE(kprobe_vfs_read, struct file *f, char *buf, size_t count, loff_t *pos) {
+  (void)buf; (void)count; (void)pos;
+  iofile_enter_kprobe(f);
+  return 0;
+}
+
+SEC("kretprobe/vfs_read")
+int BPF_KRETPROBE(kretprobe_vfs_read, long ret) {
+  iofile_exit(ret);
   return 0;
 }
 
 SEC("kprobe/vfs_write")
-int BPF_KPROBE(do_vfs_write, struct file *f, const char *buf, size_t count, loff_t *pos) {
-  (void)buf; (void)pos;
-  record_file_io(f, (u64)count);
+int BPF_KPROBE(kprobe_vfs_write, struct file *f, const char *buf, size_t count, loff_t *pos) {
+  (void)buf; (void)count; (void)pos;
+  iofile_enter_kprobe(f);
+  return 0;
+}
+
+SEC("kretprobe/vfs_write")
+int BPF_KRETPROBE(kretprobe_vfs_write, long ret) {
+  iofile_exit(ret);
   return 0;
 }
 
 // ===========================================================================
-// DEEP: file-path capture (fentry/security_file_open — allowlisted for
-// bpf_d_path on 6.6)
+// DEEP network evidence (all optional, all deep_mode + target/cookie gated)
 // ===========================================================================
-SEC("fentry/security_file_open")
-int BPF_PROG(file_open_path, struct file *f) {
+static __always_inline u64 sock_cookie(struct sock *sk) {
+  u64 c = bpf_get_socket_cookie(sk);
+  return c ? c : (u64)sk;
+}
+
+static __always_inline u32 sock_family(struct sock *sk) {
+  return (u32)BPF_CORE_READ(sk, __sk_common.skc_family);
+}
+
+static __always_inline void fill_tuple(struct sock_owner_t *o, struct sock *sk) {
+  o->family = sock_family(sk);
+  o->local_port = BPF_CORE_READ(sk, __sk_common.skc_num);
+  o->remote_port = BPF_CORE_READ(sk, __sk_common.skc_dport);
+  if (o->family == AF_INET6) {
+    __builtin_memcpy(o->local_addr,
+                     (void *)BPF_CORE_READ(sk, __sk_common.skc_v6_rcv_saddr.in6_u.u6_addr32),
+                     sizeof(o->local_addr));
+    __builtin_memcpy(o->remote_addr,
+                     (void *)BPF_CORE_READ(sk, __sk_common.skc_v6_daddr.in6_u.u6_addr32),
+                     sizeof(o->remote_addr));
+  } else {
+    o->local_addr[0] = BPF_CORE_READ(sk, __sk_common.skc_rcv_saddr);
+    o->remote_addr[0] = BPF_CORE_READ(sk, __sk_common.skc_daddr);
+  }
+  o->netns_ino = BPF_CORE_READ(sk, __sk_common.skc_net.net, ns.inum);
+}
+
+// Actual socket queue bytes: tx = sk_wmem_queued; rx derived from tcp_sock
+// rcv_nxt - copied_seq (sk_rmem_alloc is absent from 5.15 struct sock BTF).
+static __always_inline void flow_bytes(struct sock *sk, u64 *tx, u64 *rx) {
+  *tx = BPF_CORE_READ(sk, sk_wmem_queued);
+  struct tcp_sock *tp = bpf_skc_to_tcp_sock(sk);
+  if (tp) {
+    u64 nxt = BPF_CORE_READ(tp, rcv_nxt);
+    u64 cpy = BPF_CORE_READ(tp, copied_seq);
+    *rx = nxt >= cpy ? nxt - cpy : 0;
+  } else {
+    *rx = 0;
+  }
+}
+
+// kprobe/kretprobe tcp_v4/v6_connect — connect latency for target threads.
+static __always_inline void tcp_connect_enter(struct sock *sk) {
+  if (!deep_mode()) return;
+  u32 tid = (u32)bpf_get_current_pid_tgid();
+  if (!tid_is_target(tid)) return;
+  u64 cookie = sock_cookie(sk);
+  if (!cookie) return;
+  struct sock_owner_t o = {};
+  o.tgid = (u64)(bpf_get_current_pid_tgid() >> 32);
+  o.tid = tid;
+  fill_tuple(&o, sk);
+  o.start_ts = bpf_ktime_get_ns();
+  bpf_map_update_elem(&sock_owner, &cookie, &o, BPF_ANY);
+  struct connect_start_t cs = {.cookie = cookie, .ts = o.start_ts};
+  bpf_map_update_elem(&connect_start, &tid, &cs, BPF_ANY);
+}
+
+SEC("kprobe/tcp_v4_connect")
+int BPF_KPROBE(kprobe_tcp_v4_connect, struct sock *sk,
+                                struct sockaddr *uaddr, int addr_len) {
+  (void)uaddr; (void)addr_len;
+  tcp_connect_enter(sk);
+  return 0;
+}
+
+SEC("kretprobe/tcp_v4_connect")
+int BPF_KRETPROBE(kretprobe_tcp_v4_connect, int ret) {
+  // recover sk from the kprobe context: kretprobe exposes regs; read from
+  // entry path is not possible, so lookup connect_start via current tid.
   if (!deep_mode()) return 0;
   u32 tid = (u32)bpf_get_current_pid_tgid();
   if (!tid_is_target(tid)) return 0;
-  char buf[256] = {};
-  long n = bpf_d_path(&f->f_path, buf, sizeof(buf));
-  if (n <= 0) return 0;
+  struct connect_start_t *cs = bpf_map_lookup_elem(&connect_start, &tid);
+  if (!cs) return 0;
+  if (ret == 0) {
+    struct sock_owner_t *o = bpf_map_lookup_elem(&sock_owner, &cs->cookie);
+    if (o) o->established_ts = bpf_ktime_get_ns();
+  } else {
+    struct sock_owner_t *o = bpf_map_lookup_elem(&sock_owner, &cs->cookie);
+    if (o) {
+      struct sock_owner_t f = *o;
+      f.rst_reason = (u32)-ret;
+      bpf_map_update_elem(&net_flow, &cs->cookie, &f, BPF_ANY);
+      bpf_map_delete_elem(&sock_owner, &cs->cookie);
+    }
+  }
+  bpf_map_delete_elem(&connect_start, &tid);
+  return 0;
+}
 
-  u32 dev = (u32)BPF_CORE_READ(f, f_inode, i_sb, s_dev);
-  u64 ino = BPF_CORE_READ(f, f_inode, i_ino);
-  struct open_path_key k = {};
-  k.dev = dev;
-  k.ino = ino;
-  // HASH lookup returns NULL for a new key, so write the path through
-  // update_elem (create-or-overwrite) instead of lookup+memset.
-  bpf_map_update_elem(&open_path, &k, buf, BPF_ANY);
+SEC("kprobe/tcp_v6_connect")
+int BPF_KPROBE(kprobe_tcp_v6_connect, struct sock *sk,
+                                struct sockaddr *uaddr, int addr_len) {
+  (void)uaddr; (void)addr_len;
+  tcp_connect_enter(sk);
+  return 0;
+}
+
+SEC("kretprobe/tcp_v6_connect")
+int BPF_KRETPROBE(kretprobe_tcp_v6_connect, int ret) {
+  if (!deep_mode()) return 0;
+  u32 tid = (u32)bpf_get_current_pid_tgid();
+  if (!tid_is_target(tid)) return 0;
+  struct connect_start_t *cs = bpf_map_lookup_elem(&connect_start, &tid);
+  if (!cs) return 0;
+  if (ret == 0) {
+    struct sock_owner_t *o = bpf_map_lookup_elem(&sock_owner, &cs->cookie);
+    if (o) o->established_ts = bpf_ktime_get_ns();
+  } else {
+    struct sock_owner_t *o = bpf_map_lookup_elem(&sock_owner, &cs->cookie);
+    if (o) {
+      struct sock_owner_t f = *o;
+      f.rst_reason = (u32)-ret;
+      bpf_map_update_elem(&net_flow, &cs->cookie, &f, BPF_ANY);
+      bpf_map_delete_elem(&sock_owner, &cs->cookie);
+    }
+  }
+  bpf_map_delete_elem(&connect_start, &tid);
+  return 0;
+}
+
+// kretprobe/inet_csk_accept — accepted sockets attributed to the target thread.
+SEC("kretprobe/inet_csk_accept")
+int BPF_KRETPROBE(kretprobe_inet_csk_accept, int ret) {
+  if (!deep_mode()) return 0;
+  u32 tid = (u32)bpf_get_current_pid_tgid();
+  if (!tid_is_target(tid)) return 0;
+  struct sock *sk = (struct sock *)ret;
+  if (!sk) return 0;
+  u64 cookie = sock_cookie(sk);
+  if (!cookie) return 0;
+  struct sock_owner_t o = {};
+  o.tgid = (u64)(bpf_get_current_pid_tgid() >> 32);
+  o.tid = tid;
+  fill_tuple(&o, sk);
+  o.start_ts = bpf_ktime_get_ns();
+  o.established_ts = o.start_ts;
+  bpf_map_update_elem(&sock_owner, &cookie, &o, BPF_ANY);
+  return 0;
+}
+
+// tp_btf/inet_sock_set_state — flow start/close.
+SEC("tp_btf/inet_sock_set_state")
+int BPF_PROG(net_sock_state, const struct sock *sk, int oldstate, int newstate) {
+  if (!deep_mode()) return 0;
+  if (newstate == 2 /*TCP_SYN_SENT*/ || newstate == 1 /*TCP_ESTABLISHED*/) {
+    // ownership is set by connect/accept hooks; nothing to do on SYN.
+    return 0;
+  }
+  u64 cookie = bpf_get_socket_cookie((struct sock *)sk);
+  if (!cookie) return 0;
+  struct sock_owner_t *o = bpf_map_lookup_elem(&sock_owner, &cookie);
+  if (newstate == TCP_CLOSE) {
+    if (o) {
+      struct sock_owner_t f = *o;
+      flow_bytes((struct sock *)sk, &f.tx_bytes, &f.rx_bytes);
+      bpf_map_update_elem(&net_flow, &cookie, &f, BPF_ANY);
+      bpf_map_delete_elem(&sock_owner, &cookie);
+    } else {
+      // unowned close: record an unowned aggregate flow.
+      struct sock_owner_t f = {};
+      f.netns_ino = BPF_CORE_READ(sk, __sk_common.skc_net.net, ns.inum);
+      f.family = sock_family((struct sock *)sk);
+      flow_bytes((struct sock *)sk, &f.tx_bytes, &f.rx_bytes);
+      bpf_map_update_elem(&net_flow, &cookie, &f, BPF_ANY);
+    }
+  }
+  return 0;
+}
+
+// tp_btf/tcp_retransmit_skb — owner-gated retransmit counting.
+SEC("tp_btf/tcp_retransmit_skb")
+int BPF_PROG(net_tcp_retransmit, const struct sock *sk, const struct sk_buff *skb) {
+  (void)skb;
+  if (!deep_mode()) return 0;
+  u64 cookie = bpf_get_socket_cookie((struct sock *)sk);
+  if (!cookie) return 0;
+  struct sock_owner_t *o = bpf_map_lookup_elem(&sock_owner, &cookie);
+  if (o) o->retrans++;
+  return 0;
+}
+
+// tp_btf/tcp_send_reset — record reset reason on owner sockets.
+SEC("tp_btf/tcp_send_reset")
+int BPF_PROG(net_tcp_send_reset, const struct sock *sk, struct sk_buff *skb) {
+  (void)skb;
+  if (!deep_mode()) return 0;
+  u64 cookie = bpf_get_socket_cookie((struct sock *)sk);
+  if (!cookie) return 0;
+  struct sock_owner_t *o = bpf_map_lookup_elem(&sock_owner, &cookie);
+  if (o) {
+    o->rst_reason = 1;  // RST sent (reason detail not available at this tp)
+    flow_bytes((struct sock *)sk, &o->tx_bytes, &o->rx_bytes);
+    struct sock_owner_t f = *o;
+    bpf_map_update_elem(&net_flow, &cookie, &f, BPF_ANY);
+    bpf_map_delete_elem(&sock_owner, &cookie);
+  }
+  return 0;
+}
+
+// tp_btf/kfree_skb — unowned drop evidence aggregated by
+// (netns, ifindex, reason_id). Rate-limited via net_event_sample_rate.
+SEC("tp_btf/kfree_skb")
+int BPF_PROG(net_kfree_skb, struct sk_buff *skb, void *location, unsigned short protocol) {
+  (void)location;
+  if (!deep_mode()) return 0;
+  u32 zero = 0;
+  struct sample_rate_cfg *rc = bpf_map_lookup_elem(&sample_rate_cfg, &zero);
+  u32 rate = rc ? rc->net_rate : 0;
+  if (!rate) return 0;
+  struct ratelimit_t *rl = bpf_map_lookup_elem(&ratelimit, &zero);
+  u64 now = bpf_ktime_get_ns();
+  if (!rl) return 0;
+  u64 elapsed = now > rl->last_ts[1] ? now - rl->last_ts[1] : 0;
+  if (rl->last_ts[1] != 0 && elapsed * (u64)rate < 1000000000ULL) return 0;
+  rl->last_ts[1] = now;
+
+  struct net_device *dev = BPF_CORE_READ(skb, dev);
+  struct net_drop_key k = {};
+  k.ifindex = dev ? BPF_CORE_READ(dev, ifindex) : 0;
+  // netns of the skb is unreliable without the sock; use dev netns when present.
+  if (dev) k.netns_ino = BPF_CORE_READ(dev, nd_net.net, ns.inum);
+  k.reason_id = protocol;
+  u64 *c = h_u64(&net_drop, &k);
+  if (c) (*c)++;
+  return 0;
+}
+
+// tp_btf/softirq_entry + softirq_exit — per-CPU NET_RX/NET_TX count/time.
+SEC("tp_btf/softirq_entry")
+int BPF_PROG(net_softirq_entry, unsigned int vec_nr) {
+  if (!deep_mode()) return 0;
+  if (vec_nr != 3 && vec_nr != 2) return 0;  // NET_RX=3, NET_TX=2 (enum order)
+  u32 zero = 0;
+  u64 now = bpf_ktime_get_ns();
+  bpf_map_update_elem(&softirq_enter_ts, &zero, &now, BPF_ANY);
+  return 0;
+}
+
+SEC("tp_btf/softirq_exit")
+int BPF_PROG(net_softirq_exit, unsigned int vec_nr) {
+  if (!deep_mode()) return 0;
+  if (vec_nr != 3 && vec_nr != 2) return 0;
+  u32 zero = 0;
+  u64 *ts = bpf_map_lookup_elem(&softirq_enter_ts, &zero);
+  if (!ts || *ts == 0) return 0;
+  u64 now = bpf_ktime_get_ns();
+  u64 dur = now > *ts ? now - *ts : 0;
+  *ts = 0;
+  u32 cpu = bpf_get_smp_processor_id();
+  struct net_softirq_key k = {.cpu_idx = cpu, .vector = vec_nr};
+  struct lat_stat *v = h_lat(&net_softirq, &k);
+  if (v) { v->count++; v->lat_sum += dur; add_hist13(v->hist, dur); }
+  return 0;
+}
+
+// kprobe/tcp_rcv_established — sampled RTT (srtt_us>>3), owner sockets only,
+// per-socket rate limit via rtt_last.
+SEC("kprobe/tcp_rcv_established")
+int BPF_KPROBE(kprobe_tcp_rcv_established, struct sock *sk,
+                                struct sk_buff *skb) {
+  (void)skb;
+  if (!deep_mode()) return 0;
+  u64 cookie = bpf_get_socket_cookie(sk);
+  if (!cookie) return 0;
+  struct sock_owner_t *o = bpf_map_lookup_elem(&sock_owner, &cookie);
+  if (!o) return 0;
+  u32 zero = 0;
+  struct sample_rate_cfg *rc = bpf_map_lookup_elem(&sample_rate_cfg, &zero);
+  u32 rate = rc ? rc->net_rate : 0;
+  if (!rate) return 0;
+  u64 now = bpf_ktime_get_ns();
+  u64 *last = bpf_map_lookup_elem(&rtt_last, &cookie);
+  if (last) {
+    u64 elapsed = now > *last ? now - *last : 0;
+    if (elapsed * (u64)rate < 1000000000ULL) return 0;
+  }
+  struct tcp_sock *tp = bpf_skc_to_tcp_sock(sk);
+  if (!tp) return 0;
+  u64 srtt = BPF_CORE_READ(tp, srtt_us);  // RTT in 8us units
+  o->rtt_count++;
+  o->rtt_sum_us += (srtt >> 3);
+  if (last)
+    *last = now;
+  else
+    bpf_map_update_elem(&rtt_last, &cookie, &now, BPF_ANY);
   return 0;
 }
 

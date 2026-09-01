@@ -59,5 +59,13 @@
     "categories": ["cpu", "io", "memory", "lock", "syscall"],
     "pid_filter": 0,
     "enable_bpf_stats": true
+  },
+  "devices": {
+    "network_enabled": true,
+    "deep_network_enabled": true,
+    "gpu_source": "auto",
+    "deep_gpu_enabled": true,
+    "deep_gpu_interval_ms": 100,
+    "net_event_sample_rate": 16
   }
 }

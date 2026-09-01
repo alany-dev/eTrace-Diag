@@ -17,6 +17,9 @@ struct AnomalyFeatures {
   HostSnapshot host;
   EbpfCounters ebpf;
   std::vector<ProcessRow> top_tasks;
+  NetworkSnapshot network;
+  GpuSnapshot gpu;
+  CgroupSnapshot cgroup;
 };
 void to_json(nlohmann::json& j, const AnomalyFeatures& f);
 

@@ -128,13 +128,13 @@ check(status.startsWith('已加载'), '会话加载成功');
 
 // ---- overview cards ----
 const cards = document.querySelectorAll('#cards .card');
-check(cards.length === 10, `总览 10 张卡片 (${cards.length})`);
+check(cards.length === 11, `总览 11 张卡片 (${cards.length})`);
 const stageCard = [...cards].find((c) => c.querySelector('.card-title').textContent === '阶段');
 check(!!stageCard && stageCard.textContent.includes('BASE / 已结束'), '阶段卡 = BASE / 已结束');
 
 // ---- panels ----
 const panels = document.querySelectorAll('#panelHost .panel');
-check(panels.length === 8, `默认 8 面板 (${panels.length})`);
+check(panels.length === 12, `默认 12 面板 (${panels.length})`);
 const cpuPanel = [...panels].find((p) => p.querySelector('.p-title').textContent === 'CPU 利用率');
 check(!!cpuPanel && cpuPanel.querySelectorAll('canvas').length === 1, 'CPU 面板小方块含趋势图');
 // 小方块（无图例）→ 点击弹完整窗口（含图例与交互）
@@ -242,7 +242,7 @@ const latestOut = readdirSync(join(root, 'out')).filter((n) =>
   /^\d{8}-\d{6}_\d+$/.test(n) && existsSync(join(root, 'out', n, 'etrace.sqlite3'))).sort().reverse()[0];
 check(opts.includes(latestOut), `下拉包含 out/ 最新会话 ${latestOut}`);
 check(a$('selSession').value === latestOut, '默认选中 out/ 最新会话');
-check(aw.document.querySelectorAll('#cards .card').length === 10, '会话加载后卡片渲染');
+check(aw.document.querySelectorAll('#cards .card').length === 11, '会话加载后卡片渲染');
 check(a$('btnReload').disabled === false, '「重新加载」可用');
 
 // ---- 场景：服务器根不含 out/（如 --directory tools/viz）→ /out/ 404 → 明确指引 ----

@@ -40,9 +40,10 @@
     card('Swap', u(lastVal('host.mem.swap_used_pct')) + '%', '60s 均值 ' + u(mean60('host.mem.swap_used_pct')) + '%');
     card('Load1', u(lastVal('host.load.load1')), '60s 均值 ' + u(mean60('host.load.load1')));
     card('运行队列', u(lastVal('host.load.nr_running')), '60s 均值 ' + u(mean60('host.load.nr_running')));
-    card('PSI-cpu', u(lastVal('host.psi.cpu.avg10')), '60s 均值 ' + u(mean60('host.psi.cpu.avg10')));
-    card('PSI-io', u(lastVal('host.psi.io.avg10')), '60s 均值 ' + u(mean60('host.psi.io.avg10')));
-    card('PSI-mem', u(lastVal('host.psi.mem.avg10')), '60s 均值 ' + u(mean60('host.psi.mem.avg10')));
+    card('PSI-cpu', u(lastVal('host.psi.cpu.some.avg10')), '60s 均值 ' + u(mean60('host.psi.cpu.some.avg10')));
+    card('PSI-io', u(lastVal('host.psi.io.some.avg10')), '60s 均值 ' + u(mean60('host.psi.io.some.avg10')));
+    card('PSI-mem', u(lastVal('host.psi.mem.some.avg10')), '60s 均值 ' + u(mean60('host.psi.mem.some.avg10')));
+    card('TCP重传', u(lastVal('net.tcp.retrans_s')), '60s 均值 ' + u(mean60('net.tcp.retrans_s')));
     card('采集器CPU', u(lastVal('ovh.cpu_pct')) + '%', '60s 均值 ' + u(mean60('ovh.cpu_pct')) + '%');
 
     // 阶段卡
@@ -68,9 +69,7 @@
     // 重建前销毁旧图表（从 LinkGroup 摘除、断开 ResizeObserver），避免泄漏
     for (const el of host.querySelectorAll('.panel')) if (el._chart) el._chart.destroy();
     host.textContent = '';
-    const st = session.store;
     const link = V.ensurePanelLink();
-    const charts = [];
 
     for (const p of V.panels.state.panels) {
       const el = V.renderPanel(session, p, link);
@@ -178,7 +177,7 @@
     return panel;
   };
 
-  // expand a family entry using the 5.4 grouped model
+  // expand a family entry using the grouped model
   V.expandFamilyFor = function (entry, session) {
     const fam = entry.family;
     if (fam.startsWith('host.proc.')) {
@@ -197,6 +196,20 @@
       else if (entry.sel && entry.sel.length) {
         const selSet = new Set(entry.sel.map(Number));
         selected = sorted.filter((m) => selSet.has(Number(m.split('.')[2])));
+      }
+      return selected.map((m) => {
+        const s = session.store.get(m);
+        return { id: m, label: s.label, x: s.x, y: s.y, scale: 'left', unit: s.unit, scaleName: s.scale };
+      });
+    }
+    if (fam.startsWith('net.iface.') || fam.startsWith('gpu.')) {
+      // prefix = fam with the "*" replaced by "" → e.g. "net.iface..rx_mbps"
+      const prefix = fam.replace('*', '');
+      const mids = [...session.store.keys()].filter((m) => m.startsWith(prefix));
+      let selected = mids;
+      if (entry.mode === 'sel' && entry.sel && entry.sel.length) {
+        const selSet = new Set(entry.sel);
+        selected = mids.filter((m) => selSet.has(m.split('.')[2]));
       }
       return selected.map((m) => {
         const s = session.store.get(m);
@@ -298,11 +311,6 @@
         if (total && (n % 2000 === 0)) p.textContent = `加载 ${n}/${total}`;
       });
     // folded
-    let foldedText = '';
-    V.db.step(db, `SELECT kind,frames,value FROM deep_folded WHERE ordinal=? ORDER BY rowid`,
-      [ordinal], (r) => { foldedText += r.frames + ' ' + r.value + '\n'; });
-    const onCpu = V.parseFolded(foldedText);
-    // but need to split kinds: refetch per kind
     const kinds = { on_cpu: '', off_cpu: '' };
     V.db.step(db, `SELECT kind,frames,value FROM deep_folded WHERE ordinal=? ORDER BY rowid`,
       [ordinal], (r) => { kinds[r.kind] += r.frames + ' ' + r.value + '\n'; });
@@ -312,13 +320,20 @@
       runq: V.db.query(db, 'SELECT * FROM deep_runq WHERE ordinal=? ORDER BY count DESC', [ordinal]),
       lock: V.db.query(db, 'SELECT * FROM deep_lock WHERE ordinal=? ORDER BY count DESC', [ordinal]),
       iofile: V.db.query(db, 'SELECT * FROM deep_iofile WHERE ordinal=? ORDER BY bytes DESC', [ordinal]),
+      proc: V.db.query(db, 'SELECT * FROM deep_proc WHERE ordinal=? ORDER BY ts_ns', [ordinal]),
+      iodev: V.db.query(db, 'SELECT * FROM deep_io_device WHERE ordinal=? ORDER BY ops DESC', [ordinal]),
+      netflow: V.db.query(db, 'SELECT * FROM deep_net_flow WHERE ordinal=? ORDER BY tx_bytes DESC', [ordinal]),
+      netdrop: V.db.query(db, 'SELECT * FROM deep_net_drop WHERE ordinal=? ORDER BY count DESC', [ordinal]),
+      netsoft: V.db.query(db, 'SELECT * FROM deep_net_softirq WHERE ordinal=? ORDER BY count DESC', [ordinal]),
+      gpuproc: V.db.query(db, 'SELECT * FROM deep_gpu_process WHERE ordinal=? ORDER BY ts_ns', [ordinal]),
+      offcpu: V.db.query(db, 'SELECT * FROM deep_offcpu WHERE ordinal=? ORDER BY dwell_ns DESC', [ordinal]),
     };
     const gaps = V.db.query(db, 'SELECT ts_ns,from_head,to_head FROM deep_gap WHERE ordinal=? ORDER BY ts_ns', [ordinal]);
     const meta = V.db.scalar(db, 'SELECT meta_json FROM deep_episodes WHERE ordinal=?', [ordinal]);
     const summary = V.db.scalar(db, 'SELECT summary_text FROM deep_episodes WHERE ordinal=?', [ordinal]);
     const parsed = { on_cpu: V.parseFolded(kinds.on_cpu), off_cpu: V.parseFolded(kinds.off_cpu) };
 
-    const cache = { series, hot, gaps, meta, summary, parsed, onCpu };
+    const cache = { series, hot, gaps, meta, summary, parsed };
     V.deepCache[ordinal] = cache;
     p.textContent = '';
     V.renderDeepEvidence(session, cache);
@@ -599,7 +614,8 @@
                ['tid', 'tid', 'num'], ['tname', '线程名', 'txt'],
                ['syscall', '系统调用号', 'num'], ['name', '系统调用名', 'txt'],
                ['count', '次数', 'num'], ['avg_us', '均时us', 'num'],
-               ['p50_us', 'p50us', 'num'], ['p99_us', 'p99us', 'num']] },
+               ['p50_us', 'p50us', 'num'], ['p99_us', 'p99us', 'num'],
+               ['error_count', '错误数', 'num']] },
       { key: 'runq', title: '调度延迟', withTid: true,
         cols: [['pid', 'pid', 'num'], ['pname', '进程名', 'txt'],
                ['tid', 'tid', 'num'], ['tname', '线程名', 'txt'],
@@ -611,7 +627,44 @@
                ['avg_wait_ns', '均等ns', 'num']] },
       { key: 'iofile', title: 'IO 文件（全局）', withTid: false,
         cols: [['path', '路径', 'txt'], ['dev', 'dev', 'num'],
-               ['ino', 'ino', 'num'], ['bytes', '字节', 'num'], ['ops', '次数', 'num']] },
+               ['ino', 'ino', 'num'], ['bytes', '字节', 'num'], ['ops', '次数', 'num'],
+               ['errors', '错误', 'num'], ['p50_us', 'p50us', 'num'],
+               ['p99_us', 'p99us', 'num']] },
+      { key: 'proc', title: '进程证据', withTid: false,
+        cols: [['tid', 'tid', 'num'], ['comm', '进程名', 'txt'],
+               ['vm_rss_kb', 'RSS(kB)', 'num'], ['rss_anon_kb', '匿名(kB)', 'num'],
+               ['rss_file_kb', '文件(kB)', 'num'], ['rss_shmem_kb', '共享(kB)', 'num'],
+               ['vm_swap_kb', 'Swap(kB)', 'num'], ['read_bytes', '读字节', 'num'],
+               ['write_bytes', '写字节', 'num'], ['sched_run_delay_ns', '调度延迟ns', 'num'],
+               ['sched_switch_count', '切换次数', 'num']] },
+      { key: 'iodev', title: '设备 IO（DEEP）', withTid: false,
+        cols: [['dev', 'dev', 'num'], ['ops', '次数', 'num'], ['bytes', '字节', 'num'],
+               ['lat_sum', '总时延ns', 'num'], ['p50_us', 'p50us', 'num'],
+               ['p99_us', 'p99us', 'num']] },
+      { key: 'netflow', title: '网络连接流', withTid: true,
+        cols: [['pid', 'pid', 'num'], ['pname', '进程名', 'txt'],
+               ['tid', 'tid', 'num'], ['local_port', '本地端口', 'num'],
+               ['remote_port', '远端端口', 'num'], ['final_state', '状态', 'num'],
+               ['connect_latency_us', '建连时延us', 'num'], ['duration_us', '时长us', 'num'],
+               ['tx_bytes', '发送字节', 'num'], ['rx_bytes', '接收字节', 'num'],
+               ['retransmits', '重传', 'num'], ['rtt_avg_us', 'RTT均值us', 'num'],
+               ['closed', '已关闭', 'num']] },
+      { key: 'netdrop', title: '丢包证据', withTid: false,
+        cols: [['netns_ino', 'netns', 'num'], ['ifindex', '接口', 'num'],
+               ['reason_id', '原因', 'num'], ['reason', '说明', 'txt'],
+               ['count', '次数', 'num']] },
+      { key: 'netsoft', title: '网络软中断', withTid: false,
+        cols: [['cpu_idx', 'CPU', 'num'], ['vector_name', '向量', 'txt'],
+               ['count', '次数', 'num'], ['time_ns', '耗时ns', 'num']] },
+      { key: 'gpuproc', title: 'GPU 进程', withTid: false,
+        cols: [['pid', 'pid', 'num'], ['tgid', 'tgid', 'num'],
+               ['gpu_uuid', 'GPU', 'txt'], ['comm', '进程名', 'txt'],
+               ['sm_util_pct', 'SM%', 'num'], ['mem_util_pct', '显存%', 'num'],
+               ['fb_used_bytes', '显存字节', 'num']] },
+      { key: 'offcpu', title: '离CPU等待（无栈）', withTid: false,
+        cols: [['tid', 'tid', 'num'], ['comm', '线程名', 'txt'],
+               ['dwell_ns', '等待ns', 'num'], ['count', '次数', 'num'],
+               ['stack_available', '有栈', 'num']] },
     ];
     for (const c of config) {
       let rows = (hot[c.key] || []).slice();
@@ -620,8 +673,8 @@
         const m = new Map();
         for (const r of rows) {
           const k = r.path;
-          if (!m.has(k)) m.set(k, { path: k, bytes: 0, ops: 0, dev: r.dev, ino: r.ino });
-          m.get(k).bytes += r.bytes; m.get(k).ops += r.ops;
+          if (!m.has(k)) m.set(k, { path: k, bytes: 0, ops: 0, errors: 0, dev: r.dev, ino: r.ino });
+          m.get(k).bytes += r.bytes; m.get(k).ops += r.ops; m.get(k).errors += r.errors;
         }
         rows.length = 0; rows.push(...m.values());
       }

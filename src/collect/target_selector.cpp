@@ -9,18 +9,13 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "collect/bpf_values.h"
 #include "collect/host_metrics.h"
 #include "logging.h"
 
 namespace etrace_diag {
 
 namespace {
-
-// Mirrors of the per-tid PERCPU_HASH values in bpf/etrace.bpf.c.
-struct SwitchVal { u32 vol; u32 invol; };
-struct BlockIoVal { u64 ops; u64 bytes; u64 lat_sum; u32 hist[13]; };
-struct FaultsVal { u32 minor; u32 major; };
-struct LatStatVal { u64 count; u64 lat_sum; u32 hist[13]; };
 
 std::string ReadFileTrim(const std::string& path) {
   std::ifstream f(path);
@@ -121,12 +116,6 @@ double ComputeScore(const Config& cfg, double window_s, uint64_t cpu_ns, uint64_
 TargetSelector::TargetSelector(EbpfManager& ebpf, OutputWriter& writer)
     : ebpf_(ebpf), writer_(writer) {}
 
-uint64_t TargetSelector::NowNs() const {
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
-}
-
 void TargetSelector::Probe(const Config& cfg) {
   hw_ = {};
   hw_.online_cpus = (uint32_t)sysconf(_SC_NPROCESSORS_ONLN);
@@ -161,26 +150,21 @@ void TargetSelector::Probe(const Config& cfg) {
           (unsigned long long)hw_.mem_total_kb, hw_.ring_slots, thread_budget_);
 }
 
-TargetSelector::Counters TargetSelector::ReadTid(uint32_t tid) {
+TargetSelector::Counters TargetSelector::ReadTid(uint32_t tid, const ProcessRow& proc) {
   Counters c;
-  u64 v = 0;
-  if (ebpf_.Slice("on_cpu_ns")->LookupPercpuSum(&tid, &v)) c.on_cpu_ns = v;
-  SwitchVal sw = {};
-  if (ebpf_.Slice("switches")->LookupPercpuSum(&tid, &sw)) {
-    c.sw_vol = sw.vol;
-    c.sw_invol = sw.invol;
-  }
+  // CPU / voluntary & involuntary switches / faults come from the process
+  // table's monotonic per-tid fields (no on_cpu_ns/switches/faults map reads).
+  c.on_cpu_ns = proc.utime + proc.stime;   // clock ticks? -> converted below at use
+  c.sw_vol = proc.nvcsw;
+  c.sw_invol = proc.nivcsw;
+  c.pf_minor = proc.minflt;
+  c.pf_major = proc.majflt;
   BlockIoVal bi = {};
   if (ebpf_.Slice("block_io")->LookupPercpuSum(&tid, &bi)) {
     c.io_ops = bi.ops;
     c.io_bytes = bi.bytes;
   }
-  FaultsVal ft = {};
-  if (ebpf_.Slice("faults")->LookupPercpuSum(&tid, &ft)) {
-    c.pf_minor = ft.minor;
-    c.pf_major = ft.major;
-  }
-  LatStatVal lk = {};
+  LatStatVal13 lk = {};
   if (ebpf_.Slice("lock_st")->LookupPercpuSum(&tid, &lk)) c.lock_waits = lk.count;
   return c;
 }
@@ -207,16 +191,16 @@ void TargetSelector::ApplyPinned(const Config& cfg) {
     st.tgid = tgid;
     st.member = true;
     st.pinned_proc = true;
-    st.joined_ns = NowNs();
+    st.joined_ns = std::chrono::steady_clock::now().time_since_epoch().count();
   }
 }
 
 void TargetSelector::Join(uint32_t tid, uint32_t tgid, double score, uint32_t proc_rank) {
   std::string comm = HostMetrics::ReadComm(tid);
   ebpf_.AddTarget(tid, 2 /*dynamic*/, tgid, comm.c_str());
-  nlohmann::json e = {{"v", 1},         {"ts_ns", NowNs()}, {"action", "join"},
-                      {"tid", tid},     {"tgid", tgid},     {"comm", comm},
-                      {"score", score}, {"rank", proc_rank}};
+  nlohmann::json e = {{"v", 2},         {"ts_ns", std::chrono::steady_clock::now().time_since_epoch().count()},
+                      {"action", "join"}, {"tid", tid},     {"tgid", tgid},
+                      {"comm", comm},   {"score", score},   {"rank", proc_rank}};
   writer_.WriteTargetsEvent(e);
   LogInfo("target join tid=%u tgid=%u comm=%s score=%.4f rank=%u", tid, tgid, comm.c_str(),
           score, proc_rank);
@@ -224,36 +208,47 @@ void TargetSelector::Join(uint32_t tid, uint32_t tgid, double score, uint32_t pr
 
 void TargetSelector::Leave(uint32_t tid, uint32_t proc_rank) {
   ebpf_.RemoveTarget(tid);
+  ebpf_.ResetTidCounters(tid);  // avoid recorder delta spikes on rejoin/PID reuse
   std::string comm = HostMetrics::ReadComm(tid);
-  nlohmann::json e = {{"v", 1},      {"ts_ns", NowNs()}, {"action", "leave"},
-                      {"tid", tid},  {"comm", comm},     {"rank", proc_rank}};
+  nlohmann::json e = {{"v", 2}, {"ts_ns", std::chrono::steady_clock::now().time_since_epoch().count()},
+                      {"action", "leave"}, {"tid", tid}, {"comm", comm}, {"rank", proc_rank}};
   writer_.WriteTargetsEvent(e);
   LogInfo("target leave tid=%u rank=%u", tid, proc_rank);
 }
 
-bool TargetSelector::Evaluate(const Config& cfg) {
-  uint64_t now = NowNs();
+bool TargetSelector::Evaluate(const Config& cfg, const std::vector<ProcessRow>& process_table,
+                              uint64_t now_ns) {
   const auto& t = cfg.targets;
+  bool faults_available = EbpfManager::HasTaskFaultFields();
 
-  // 1. tid -> tgid from the kernel process iter (full table, one pass).
-  std::vector<ProcessRow> proctable;
-  ebpf_.ReadProcessTable(proctable);
+  // 1. tid -> tgid + tid -> row from the caller's process table (single pass).
   std::unordered_map<uint32_t, uint32_t> tid2tgid;
-  tid2tgid.reserve(proctable.size());
-  for (const auto& r : proctable) tid2tgid[r.pid] = r.tgid ? r.tgid : r.pid;
+  std::unordered_map<uint32_t, const ProcessRow*> tid2row;
+  tid2tgid.reserve(process_table.size());
+  tid2row.reserve(process_table.size());
+  for (const auto& r : process_table) {
+    tid2tgid[r.pid] = r.tgid ? r.tgid : r.pid;
+    tid2row[r.pid] = &r;
+  }
 
-  // 2. Full per-tid cumulative counter snapshot.
+  // 2. Full per-tid cumulative counter snapshot from the process table.
   Snapshot snap;
-  snap.ts_ns = now;
-  struct TidCollect { std::vector<uint32_t> tids; } col;
-  ebpf_.Slice("on_cpu_ns")->ForEach(
-      [&col](const void* key, const void*) { col.tids.push_back(*(const uint32_t*)key); });
-  for (uint32_t tid : col.tids) snap.c[tid] = ReadTid(tid);
+  snap.ts_ns = now_ns;
+  for (const auto& r : process_table) {
+    // pid-reuse break: a changed start_time resets this tid's history below.
+    auto it = start_time_.find(r.pid);
+    if (it != start_time_.end() && it->second != r.start_time) {
+      start_time_.erase(it);
+    }
+    snap.c[r.pid] = ReadTid(r.pid, r);
+  }
+  start_time_.clear();
+  for (const auto& r : process_table) start_time_[r.pid] = r.start_time;
 
   // 3. Slide the window: drop snapshots older than window_seconds.
   history_.push_back(std::move(snap));
   while (history_.size() > 2 &&
-         now - history_.front().ts_ns > t.window_seconds * 1000000000ULL)
+         now_ns - history_.front().ts_ns > t.window_seconds * 1000000000ULL)
     history_.pop_front();
   if (history_.size() < 2) return false;  // first eval: establish baseline only
 
@@ -283,16 +278,25 @@ bool TargetSelector::Evaluate(const Config& cfg) {
     thread_delta[tid] = d;
     uint64_t sw = d.sw_vol + d.sw_invol;
     uint64_t faults = d.pf_minor + d.pf_major;
+    // task_struct utime/stime are in USER_HZ clock ticks; normalize to ns.
+    const double ticks_per_s = (double)sysconf(_SC_CLK_TCK);
+    double cpu_ns = ticks_per_s > 0 ? d.on_cpu_ns * 1e9 / ticks_per_s : 0;
     tid_score[tid] =
-        ComputeScore(cfg, window_s, d.on_cpu_ns, sw, d.io_ops, d.io_bytes, faults, d.lock_waits);
+        ComputeScore(cfg, window_s, (uint64_t)cpu_ns, sw, d.io_ops, d.io_bytes, faults,
+                     d.lock_waits);
     uint32_t tgid = tid2tgid.count(tid) ? tid2tgid[tid] : tid;
     auto& a = pacc[tgid];
-    a.on_cpu_ns += d.on_cpu_ns;
+    a.on_cpu_ns += (uint64_t)cpu_ns;
     a.sw += sw;
     a.io_ops += d.io_ops;
     a.io_bytes += d.io_bytes;
     a.faults += faults;
     a.lock += d.lock_waits;
+  }
+  if (!faults_available) {
+    // CO-RE lacks min_flt/maj_flt: drop the fault weight entirely instead of
+    // ranking on fabricated zeros.
+    LogWarn("CO-RE BTF lacks task_struct.min_flt/maj_flt: fault weight unavailable");
   }
 
   // 5. Process score + rank.
@@ -319,7 +323,7 @@ bool TargetSelector::Evaluate(const Config& cfg) {
     uint32_t r = rank.count(tgid) ? rank[tgid] : 0xFFFFFFFFu;
     if (st.member) {
       if (r > t.leave_rank) st.bad_streak++; else st.bad_streak = 0;
-      uint64_t residency = now - st.joined_ns;
+      uint64_t residency = now_ns - st.joined_ns;
       if (st.bad_streak >= t.hold_periods &&
           residency >= t.min_residency_seconds * 1000000000ULL)
         leave_list.push_back(tgid);
@@ -347,7 +351,7 @@ bool TargetSelector::Evaluate(const Config& cfg) {
     if (member_proc >= proc_budget) break;
     pstate_[tgid].member = true;
     pstate_[tgid].good_streak = 0;
-    pstate_[tgid].joined_ns = now;
+    pstate_[tgid].joined_ns = now_ns;
     member_proc++;
   }
 
@@ -380,7 +384,7 @@ bool TargetSelector::Evaluate(const Config& cfg) {
   if (desired.empty() && !pscored.empty()) {
     uint32_t top = pscored[0].first;
     pstate_[top].member = true;
-    pstate_[top].joined_ns = now;
+    pstate_[top].joined_ns = now_ns;
     auto it = threads_by_proc.find(top);
     if (it != threads_by_proc.end()) {
       uint32_t take = t.per_proc_threads;

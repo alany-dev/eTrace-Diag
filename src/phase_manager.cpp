@@ -30,7 +30,7 @@ void PhaseManager::EnterDeep(const Config& cfg, uint64_t now_ns) {
 
 void PhaseManager::FinalizeDeep(const Config& cfg, uint64_t now_ns) {
   nlohmann::json summary;
-  summary["v"] = 1;
+  summary["v"] = 2;
   summary["anomaly_start_ts"] = anomaly_start_ts_;
   summary["anomaly_end_ts"] = anomaly_end_ts_;
   summary["post_deadline_ts"] = post_deadline_ns_;

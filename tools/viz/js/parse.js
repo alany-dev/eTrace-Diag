@@ -15,6 +15,10 @@
     ms:    { unit: 'ms',   lock0: true,  lock100: false },
     load:  { unit: 'load', lock0: false, lock100: false },
     bool:  { unit: '0/1',  lock0: true,  lock100: false },
+    w:     { unit: 'W',    lock0: true,  lock100: false },
+    temp:  { unit: '°C',   lock0: false, lock100: false },
+    pps:   { unit: '包/s', lock0: true,  lock100: false },
+    frac:  { unit: '0-1',  lock0: false, lock100: true },
   };
 
   // ---- metric registry. Each entry: {mid,label,table,kind,scale,expr(prev,cur,{s,ns})}
@@ -27,11 +31,14 @@
     user: c.cu_user - p.cu_user, nice: c.cu_nice - p.cu_nice, sys: c.cu_sys - p.cu_sys,
     idle: c.cu_idle - p.cu_idle, iowait: c.cu_iowait - p.cu_iowait,
     irq: c.cu_irq - p.cu_irq, softirq: c.cu_softirq - p.cu_softirq, steal: c.cu_steal - p.cu_steal,
+    guest: c.cu_guest - p.cu_guest, guest_nice: c.cu_guest_nice - p.cu_guest_nice,
   });
-  const allSum = (d) => d.user + d.nice + d.sys + d.idle + d.iowait + d.irq + d.softirq + d.steal;
+  const allSum = (d) => d.user + d.nice + d.sys + d.idle + d.iowait + d.irq + d.softirq +
+                         d.steal + d.guest + d.guest_nice;
   const cpuPct = (p, c, pick) => { const A = allSum(cpuD(p, c)); return A ? 100 * pick(cpuD(p, c)) / A : null; };
 
-  const CPU_MONO = ['cu_user', 'cu_nice', 'cu_sys', 'cu_idle', 'cu_iowait', 'cu_irq', 'cu_softirq', 'cu_steal'];
+  const CPU_MONO = ['cu_user', 'cu_nice', 'cu_sys', 'cu_idle', 'cu_iowait', 'cu_irq',
+                    'cu_softirq', 'cu_steal', 'cu_guest', 'cu_guest_nice'];
   reg({ mid: 'host.cpu.usage_pct', label: 'CPU 利用率', table: 'host', scale: 'pct', kind: 'counter', mono: CPU_MONO,
     expr(p, c) { return cpuPct(p, c, (d) => d.user + d.nice + d.sys + d.irq + d.softirq + d.steal + d.iowait); } });
   reg({ mid: 'host.cpu.user_pct', label: '用户态', table: 'host', scale: 'pct', kind: 'counter', mono: CPU_MONO,
@@ -69,8 +76,13 @@
 
   ['cpu', 'io', 'mem'].forEach((grp) => {
     ['avg10', 'avg60', 'avg300'].forEach((w) => {
-      reg({ mid: `host.psi.${grp}.${w}`, label: `PSI ${grp} ${w}`, table: 'host', scale: 'pct', kind: 'gauge',
-        expr(p, c) { return c[`psi_${grp}${w}`]; } });
+      const num = w.slice(3);   // 10|60|300
+      reg({ mid: `host.psi.${grp}.some.${w}`, label: `PSI ${grp} some ${w}`, table: 'host',
+        scale: 'pct', kind: 'gauge',
+        expr(p, c) { return c[`psi_${grp}_s${num}`] != null && c[`psi_${grp}_s_valid`] ? c[`psi_${grp}_s${num}`] : null; } });
+      reg({ mid: `host.psi.${grp}.full.${w}`, label: `PSI ${grp} full ${w}`, table: 'host',
+        scale: 'pct', kind: 'gauge',
+        expr(p, c) { return c[`psi_${grp}_f${num}`] != null && c[`psi_${grp}_f_valid`] ? c[`psi_${grp}_f${num}`] : null; } });
     });
   });
 
@@ -79,8 +91,9 @@
     expr(p, c, t) { return t.ns ? 100 * (c.on_cpu_ns_total - p.on_cpu_ns_total) / t.ns : null; } });
   reg({ mid: 'ebpf.switches_s', label: '切换', table: 'anomaly', scale: 'rate', kind: 'counter', mono: ['switch_total'],
     expr(p, c, t) { return t.s ? (c.switch_total - p.switch_total) / t.s : null; } });
-  reg({ mid: 'ebpf.faults_s', label: '缺页', table: 'anomaly', scale: 'rate', kind: 'counter', mono: ['faults_total'],
-    expr(p, c, t) { return t.s ? (c.faults_total - p.faults_total) / t.s : null; } });
+  reg({ mid: 'ebpf.faults_s', label: '缺页', table: 'anomaly', scale: 'rate',
+    mono: ['minor_faults_total', 'major_faults_total'],
+    expr(p, c, t) { return t.s ? ((c.minor_faults_total + c.major_faults_total) - (p.minor_faults_total + p.major_faults_total)) / t.s : null; } });
   reg({ mid: 'ebpf.io_ops_s', label: 'IOPS', table: 'anomaly', scale: 'rate', kind: 'counter', mono: ['io_ops_total'],
     expr(p, c, t) { return t.s ? (c.io_ops_total - p.io_ops_total) / t.s : null; } });
   reg({ mid: 'ebpf.io_mbs', label: 'IO 吞吐', table: 'anomaly', scale: 'mbps', kind: 'counter', mono: ['io_bytes_total'],
@@ -158,8 +171,28 @@
       if (mid.endsWith('_await_ms')) return 'ms';
     }
     if (mid.startsWith('bpf.prog.')) return mid.endsWith('runs_s') ? 'rate' : 'ms';
-    if (mid.startsWith('iodev.')) return mid.endsWith('ops_s') ? 'rate' : mid.endsWith('mbs') ? 'mbps' : 'ms';
-    if (mid.startsWith('host.proc.')) return mid.endsWith('cpu_pct') ? 'pct' : 'mb';
+    if (mid.startsWith('net.iface.')) {
+      if (mid.endsWith('_mbps')) return 'mbps';
+      if (mid.endsWith('_pps')) return 'pps';
+      return 'rate';
+    }
+    if (mid.startsWith('net.softnet.')) return mid.endsWith('backlog_len') ? 'count' : 'rate';
+    if (mid.startsWith('net.tcp.')) return mid.endsWith('_estab') || mid.endsWith('sock_mem_kb') ? 'count' : 'rate';
+    if (mid.startsWith('cgroup.')) {
+      if (mid.endsWith('_pct')) return 'pct';
+      if (mid.endsWith('_mb')) return 'mb';
+      if (mid.endsWith('_s') || mid.endsWith('_oom_s')) return 'rate';
+      return 'count';
+    }
+    if (mid.startsWith('gpu.')) {
+      if (mid.endsWith('util_pct') || mid.endsWith('mem_pct') || mid.endsWith('enc_pct') ||
+          mid.endsWith('dec_pct')) return 'pct';
+      if (mid.endsWith('temp_c')) return 'temp';
+      if (mid.endsWith('power_w')) return 'w';
+      if (mid.endsWith('_mb')) return 'mb';
+      if (mid.endsWith('_mbps')) return 'mbps';
+      return 'count';
+    }
     if (mid.startsWith('ebpf.tid.')) {
       if (mid.includes('cpu_pct')) return 'pct';
       if (mid.includes('io_mbs')) return 'mbps';
@@ -174,10 +207,10 @@
   // store: Map<mid, {x:Array,y:Array,unit,scale,label}>
   // ------------------------------------------------------------------
   V.extract = function (db) {
+    const enums = { cores: [], disks: [], procs: [], tids: [], bpfProgs: [], ifaces: [], gpus: [] };
+    const store = new Map();
     const t0 = V.db.scalar(db, 'SELECT MIN(ts_ns) FROM host')
             ?? V.db.scalar(db, 'SELECT MIN(ts_ns) FROM anomaly') ?? 0;
-    const store = new Map();
-    const enums = { cores: [], disks: [], procs: [], tids: [], bpfProgs: [], iodevs: [] };
     const tidRaw = new Map();   // 本次 extract 的 per-tid 原始序列（会话内局部，避免跨会话污染）
     const events = [];
     const bands = [];
@@ -195,15 +228,23 @@
       const s = series(mid, scale, label);
       s.x.push(x); s.y.push(y);
     };
-
-    // ---- host (gauge on every row; counter on consecutive rows) ----
     let prev = null;
     V.db.step(db,
       `SELECT ts_ns,cu_user,cu_nice,cu_sys,cu_idle,cu_iowait,cu_irq,cu_softirq,cu_steal,` +
-      `load1,load5,load15,nr_running,nr_threads,mem_total_kb,mem_avail_kb,mem_free_kb,` +
-      `buffers_kb,cached_kb,swap_total_kb,swap_free_kb,anon_pages_kb,vm_pgfault,vm_pgmajfault,` +
-      `vm_pswpin,vm_pswpout,vm_free_pages,vm_anon_pages,psi_cpu10,psi_cpu60,psi_cpu300,` +
-      `psi_io10,psi_io60,psi_io300,psi_mem10,psi_mem60,psi_mem300 FROM host ORDER BY ts_ns`,
+      `cu_guest,cu_guest_nice,load1,load5,load15,nr_running,nr_threads,` +
+      `mem_total_kb,mem_avail_kb,mem_free_kb,buffers_kb,cached_kb,` +
+      `swap_total_kb,swap_free_kb,anon_pages_kb,` +
+      `sreclaimable_kb,shmem_kb,dirty_kb,writeback_kb,commit_limit_kb,committed_as_kb,` +
+      `mem_valid_mask,` +
+      `vm_pgfault,vm_pgmajfault,vm_pswpin,vm_pswpout,` +
+      `vm_pgscan_kswapd,vm_pgscan_direct,vm_pgsteal_kswapd,vm_pgsteal_direct,` +
+      `vm_workingset_refault,vm_nr_dirty,vm_nr_writeback,vm_valid_mask,` +
+      `psi_cpu_s10,psi_cpu_s60,psi_cpu_s300,psi_cpu_s_valid,` +
+      `psi_io_s10,psi_io_s60,psi_io_s300,psi_io_s_valid,` +
+      `psi_io_f10,psi_io_f60,psi_io_f300,psi_io_f_valid,` +
+      `psi_mem_s10,psi_mem_s60,psi_mem_s300,psi_mem_s_valid,` +
+      `psi_mem_f10,psi_mem_f60,psi_mem_f300,psi_mem_f_valid,` +
+      `ctxt,processes,procs_running,procs_blocked FROM host ORDER BY ts_ns`,
       null, (r) => {
         const x = (r.ts_ns - t0) / 1e9;
         for (const m of METRICS) {
@@ -303,8 +344,8 @@
     // ---- anomaly totals ----
     let ap = null;
     V.db.step(db, `SELECT ts_ns,on_cpu_ns_total,switch_total,io_ops_total,io_bytes_total,` +
-      `faults_total,lock_waits_total FROM anomaly ORDER BY ts_ns`, null, (r) => {
-        const x = (r.ts_ns - t0) / 1e9;
+      `minor_faults_total,major_faults_total,lock_waits_total FROM anomaly ORDER BY ts_ns`,
+      null, (r) => {
         if (ap) {
           const t = { s: (r.ts_ns - ap.ts_ns) / 1e9, ns: r.ts_ns - ap.ts_ns };
           for (const mid of ['ebpf.busy_pct', 'ebpf.switches_s', 'ebpf.faults_s',
@@ -335,53 +376,117 @@
         ts.x.push((r.ts_ns - t0) / 1e9);
         for (const k of Object.keys(ts.raw)) ts.raw[k].push(r[k] || 0);
       });
-
-    // ---- bpf_stats (parametric per prog) ----
-    const bpfPrev = new Map();
-    V.db.step(db, `SELECT ts_ns,prog_name,run_cnt,run_time_ns FROM bpf_stats ` +
-      `ORDER BY ts_ns,prog_name`, null, (r) => {
-        enums.bpfProgs.push(r.prog_name);
-        const prev = bpfPrev.get(r.prog_name);
-        const x = (r.ts_ns - t0) / 1e9;
-        if (prev) {
-          const dt = (r.ts_ns - prev.ts_ns) / 1e9;
-          const dc = r.run_cnt - prev.run_cnt, dtm = r.run_time_ns - prev.run_time_ns;
-          if (dt) {
-            if (dc >= 0) push(`bpf.prog.${r.prog_name}.runs_s`, 'rate', `程序调用 ${r.prog_name}`, x, dc / dt);
-            if (dtm >= 0) push(`bpf.prog.${r.prog_name}.ms_per_s`, 'ms', `内核耗时 ${r.prog_name}`, x, dtm / dt / 1e6);
-          }
-        }
-        bpfPrev.set(r.prog_name, r);
-      });
-    enums.bpfProgs = [...new Set(enums.bpfProgs)];
-
-    // ---- io_devices (dev -> disk name best-effort) ----
-    const mm = new Map();
-    V.db.step(db, `SELECT DISTINCT name,major,minor FROM host_disk`, null, (r) =>
-      mm.set(r.major + ':' + r.minor, r.name));
-    const decodeDev = (dev) => ({
-      major: (Number(dev) >> 8) & 0xfff,
-      minor: (Number(dev) & 0xff) | ((Number(dev) >> 12) & 0xfff00),
-    });
-    const iodevPrev = new Map();
-    V.db.step(db, `SELECT ts_ns,dev,ops,bytes,lat_sum FROM io_devices ORDER BY ts_ns,dev`,
+    // ---- net_iface (parametric per name; counters handle wrap) ----
+    const ifacePrev = new Map();
+    V.db.step(db, `SELECT ts_ns,ifindex,name,valid,rx_bytes,rx_packets,rx_errors,rx_dropped,` +
+      `tx_bytes,tx_packets,tx_errors,tx_dropped FROM net_iface ORDER BY ts_ns,ifindex`,
       null, (r) => {
-        const { major, minor } = decodeDev(r.dev);
-        const name = mm.get(major + ':' + minor);
-        const label = name || '0x' + (Number(r.dev) >>> 0).toString(16);
-        if (!enums.iodevs.includes(label)) enums.iodevs.push(label);
-        const prev = iodevPrev.get(label);
+        if (r.valid === 0) return;
+        if (!enums.ifaces.some((i) => i.name === r.name)) enums.ifaces.push({ ifindex: r.ifindex, name: r.name });
+        const prev = ifacePrev.get(r.name);
         const x = (r.ts_ns - t0) / 1e9;
         if (prev) {
           const dt = (r.ts_ns - prev.ts_ns) / 1e9;
-          const dop = r.ops - prev.ops, dbts = r.bytes - prev.bytes, dlat = r.lat_sum - prev.lat_sum;
           if (dt) {
-            if (dop >= 0) push(`iodev.${label}.ops_s`, 'rate', `设备IOPS ${label}`, x, dop / dt);
-            if (dbts >= 0) push(`iodev.${label}.mbs`, 'mbps', `设备吞吐 ${label}`, x, dbts / 1e6 / dt);
-            if (dop > 0 && dlat >= 0) push(`iodev.${label}.await_ms`, 'ms', `设备时延 ${label}`, x, dlat / dop / 1e6);
+            const drx = r.rx_bytes - prev.rx_bytes, dtx = r.tx_bytes - prev.tx_bytes;
+            const drp = r.rx_packets - prev.rx_packets, dtp = r.tx_packets - prev.tx_packets;
+            if (drx >= 0) push(`net.iface.${r.name}.rx_mbps`, 'mbps', `接收 ${r.name}`, x, drx * 8 / 1e6 / dt);
+            if (dtx >= 0) push(`net.iface.${r.name}.tx_mbps`, 'mbps', `发送 ${r.name}`, x, dtx * 8 / 1e6 / dt);
+            if (drp >= 0) push(`net.iface.${r.name}.rx_pps`, 'pps', `收包 ${r.name}`, x, drp / dt);
+            if (dtp >= 0) push(`net.iface.${r.name}.tx_pps`, 'pps', `发包 ${r.name}`, x, dtp / dt);
+            if (r.rx_errors >= prev.rx_errors) push(`net.iface.${r.name}.rx_err_s`, 'rate', `收错 ${r.name}`, x, (r.rx_errors - prev.rx_errors) / dt);
+            if (r.tx_errors >= prev.tx_errors) push(`net.iface.${r.name}.tx_err_s`, 'rate', `发错 ${r.name}`, x, (r.tx_errors - prev.tx_errors) / dt);
+            if (r.rx_dropped >= prev.rx_dropped) push(`net.iface.${r.name}.rx_drop_s`, 'rate', `收丢 ${r.name}`, x, (r.rx_dropped - prev.rx_dropped) / dt);
+            if (r.tx_dropped >= prev.tx_dropped) push(`net.iface.${r.name}.tx_drop_s`, 'rate', `发丢 ${r.name}`, x, (r.tx_dropped - prev.tx_dropped) / dt);
           }
         }
-        iodevPrev.set(label, r);
+        ifacePrev.set(r.name, r);
+      });
+
+    // ---- net_stack (low-cardinality protocol counters) ----
+    const stackMono = ['active_opens', 'passive_opens', 'attempt_fails', 'estab_resets',
+      'retrans_segs', 'out_rsts', 'in_errs', 'syn_retrans', 'timeouts',
+      'listen_overflows', 'listen_drops', 'udp_no_ports'];
+    const stackLabels = { active_opens_s: '主动建连', passive_opens_s: '被动建连',
+      attempt_fails_s: '建连失败', estab_resets_s: '连接复位', retrans_s: '重传',
+      out_rsts_s: '发出RST', in_errs_s: '收包错误', syn_retrans_s: 'SYN重传',
+      timeouts_s: '超时', listen_overflows_s: 'listen溢出', listen_drops_s: 'listen丢弃',
+      udp_no_ports_s: 'UDP无端口' };
+    let stackPrev = null;
+    V.db.step(db, `SELECT * FROM net_stack ORDER BY ts_ns`, null, (r) => {
+      const x = (r.ts_ns - t0) / 1e9;
+      if (stackPrev) {
+        const dt = (r.ts_ns - stackPrev.ts_ns) / 1e9;
+        if (dt) {
+          for (const col of stackMono) {
+            if (r[col] >= stackPrev[col])
+              push(`net.tcp.${col}_s`, 'rate', stackLabels[`${col}_s`] || col, x, (r[col] - stackPrev[col]) / dt);
+          }
+        }
+        push('net.tcp.curr_estab', 'count', '当前连接', x, r.curr_estab);
+        push('net.tcp.sock_mem_kb', 'count', 'TCP内存', x, r.tcp_sock_mem * 4);
+      }
+      stackPrev = r;
+    });
+
+    // ---- net_softnet (per-cpu) ----
+    const softPrev = new Map();
+    V.db.step(db, `SELECT ts_ns,cpu_idx,processed,dropped,time_squeeze,backlog_len,` +
+      `net_rx_softirq,net_tx_softirq FROM net_softnet ORDER BY ts_ns,cpu_idx`, null, (r) => {
+        const prev = softPrev.get(r.cpu_idx);
+        const x = (r.ts_ns - t0) / 1e9;
+        push(`net.softnet.${r.cpu_idx}.backlog_len`, 'count', `软中断积压核${r.cpu_idx}`, x, r.backlog_len);
+        if (prev) {
+          const dt = (r.ts_ns - prev.ts_ns) / 1e9;
+          if (dt) {
+            if (r.processed >= prev.processed) push(`net.softnet.${r.cpu_idx}.processed_s`, 'rate', `软中断处理核${r.cpu_idx}`, x, (r.processed - prev.processed) / dt);
+            if (r.dropped >= prev.dropped) push(`net.softnet.${r.cpu_idx}.dropped_s`, 'rate', `软中断丢包核${r.cpu_idx}`, x, (r.dropped - prev.dropped) / dt);
+            if (r.time_squeeze >= prev.time_squeeze) push(`net.softnet.${r.cpu_idx}.time_squeeze_s`, 'rate', `软中断挤压核${r.cpu_idx}`, x, (r.time_squeeze - prev.time_squeeze) / dt);
+            if (r.net_rx_softirq >= prev.net_rx_softirq) push(`net.softnet.${r.cpu_idx}.net_rx_softirq_s`, 'rate', `NET_RX核${r.cpu_idx}`, x, (r.net_rx_softirq - prev.net_rx_softirq) / dt);
+            if (r.net_tx_softirq >= prev.net_tx_softirq) push(`net.softnet.${r.cpu_idx}.net_tx_softirq_s`, 'rate', `NET_TX核${r.cpu_idx}`, x, (r.net_tx_softirq - prev.net_tx_softirq) / dt);
+          }
+        }
+        softPrev.set(r.cpu_idx, r);
+      });
+
+    // ---- gpu_device (per uuid; skip unavailable) ----
+    V.db.step(db, `SELECT ts_ns,uuid,available,util_pct,mem_util_pct,mem_used_bytes,` +
+      `mem_total_bytes,temperature_c,power_w,encoder_util_pct,decoder_util_pct,` +
+      `pcie_rx_kbps,pcie_tx_kbps FROM gpu_device WHERE available=1 ORDER BY ts_ns,uuid`,
+      null, (r) => {
+        if (!enums.gpus.some((g) => g === r.uuid)) enums.gpus.push(r.uuid);
+        const x = (r.ts_ns - t0) / 1e9;
+        push(`gpu.${r.uuid}.util_pct`, 'pct', `GPU利用率 ${r.uuid}`, x, r.util_pct);
+        push(`gpu.${r.uuid}.mem_used_mb`, 'mb', `GPU显存 ${r.uuid}`, x, r.mem_used_bytes / 1e6);
+        if (r.mem_total_bytes) push(`gpu.${r.uuid}.mem_pct`, 'pct', `GPU显存占比 ${r.uuid}`, x, 100 * r.mem_used_bytes / r.mem_total_bytes);
+        push(`gpu.${r.uuid}.temp_c`, 'temp', `GPU温度 ${r.uuid}`, x, r.temperature_c);
+        push(`gpu.${r.uuid}.power_w`, 'w', `GPU功耗 ${r.uuid}`, x, r.power_w);
+        push(`gpu.${r.uuid}.enc_pct`, 'pct', `GPU编码 ${r.uuid}`, x, r.encoder_util_pct);
+        push(`gpu.${r.uuid}.dec_pct`, 'pct', `GPU解码 ${r.uuid}`, x, r.decoder_util_pct);
+        push(`gpu.${r.uuid}.pcie_rx_mbps`, 'mbps', `PCIe收 ${r.uuid}`, x, r.pcie_rx_kbps * 8 / 1000);
+        push(`gpu.${r.uuid}.pcie_tx_mbps`, 'mbps', `PCIe发 ${r.uuid}`, x, r.pcie_tx_kbps * 8 / 1000);
+      });
+
+    // ---- cgroup (collector's own cgroup) ----
+    let cgPrev = null;
+    V.db.step(db, `SELECT ts_ns,available,cpu_usage_usec,nr_throttled,throttled_usec,` +
+      `memory_current_bytes,memory_events_oom,cpu_psi_s10,cpu_psi_s_valid FROM cgroup ` +
+      `WHERE available=1 ORDER BY ts_ns`, null, (r) => {
+        const x = (r.ts_ns - t0) / 1e9;
+        if (cgPrev) {
+          const dt = (r.ts_ns - cgPrev.ts_ns) / 1e9;
+          if (dt) {
+            if (r.cpu_usage_usec >= cgPrev.cpu_usage_usec)
+              push('cgroup.cpu_usage_pct', 'pct', 'cgroup CPU', x, 100 * (r.cpu_usage_usec - cgPrev.cpu_usage_usec) / dt / 1e6);
+            if (r.throttled_usec >= cgPrev.throttled_usec)
+              push('cgroup.cpu_throttled_pct', 'pct', 'cgroup 节流', x, 100 * (r.throttled_usec - cgPrev.throttled_usec) / dt / 1e6);
+            if (r.memory_events_oom >= cgPrev.memory_events_oom)
+              push('cgroup.mem_events_oom_s', 'rate', 'cgroup OOM', x, (r.memory_events_oom - cgPrev.memory_events_oom) / dt);
+          }
+        }
+        push('cgroup.mem_current_mb', 'mb', 'cgroup 内存', x, r.memory_current_bytes / 1e6);
+        if (r.cpu_psi_s_valid) push('cgroup.cpu_psi_s10', 'pct', 'cgroup PSI cpu', x, r.cpu_psi_s10);
+        cgPrev = r;
       });
 
     // ---- memory_events + oom_events ----

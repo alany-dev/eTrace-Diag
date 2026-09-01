@@ -43,3 +43,7 @@ n = sqlite3.connect(sys.argv[1]).execute(
     "AND (path LIKE '%fio%' OR path LIKE '/tmp/%')").fetchone()[0]
 sys.exit(0 if n else 1)
 PY
+# v2 deep evidence: device-level DEEP I/O and host_disk weighted queue.
+db_path="$(latest_session)etrace.sqlite3"
+require_db_rows "$db_path" "SELECT COUNT(*) FROM deep_io_device" "deep_io_device 行"
+require_db_rows "$db_path" "SELECT COUNT(*) FROM host_disk WHERE weighted_ticks_ms IS NOT NULL" "host_disk weighted_ticks_ms"

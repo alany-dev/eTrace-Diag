@@ -13,12 +13,21 @@ void to_json(json& j, const AnomalyFeatures& f) {
   to_json(host, f.host);
   json ebpf;
   to_json(ebpf, f.ebpf);
-  j = json{{"v", 1},
+  json network;
+  to_json(network, f.network);
+  json gpu;
+  to_json(gpu, f.gpu);
+  json cgroup;
+  to_json(cgroup, f.cgroup);
+  j = json{{"v", 2},
            {"seq", f.seq},
            {"ts_ns", f.ts_ns},
            {"host", host},
            {"ebpf", ebpf},
-           {"top_tasks", top}};
+           {"top_tasks", top},
+           {"network", network},
+           {"gpu", gpu},
+           {"cgroup", cgroup}};
 }
 
 void from_json(const json& j, AnomalyResult& r) {
@@ -39,7 +48,7 @@ void from_json(const json& j, AnomalyResult& r) {
 }
 
 void to_json(json& j, const CausalContext& c) {
-  j = json{{"v", 1},
+  j = json{{"v", 2},
            {"seq", c.seq},
            {"window_start_ns", c.window_start_ns},
            {"window_end_ns", c.window_end_ns},

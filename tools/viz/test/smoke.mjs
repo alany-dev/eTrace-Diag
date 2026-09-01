@@ -55,13 +55,41 @@ const db = new SQL.Database(readFileSync(join(dir, 'etrace.sqlite3')));
 // ---- tables ----
 const tables = db.exec("SELECT name FROM sqlite_master WHERE type='table'")[0].values.map((r) => r[0]);
 const expected = ['meta', 'host', 'host_cpu', 'host_disk', 'host_proc', 'anomaly', 'anomaly_tid',
-  'proc_overhead', 'bpf_stats', 'io_devices', 'memory_events', 'oom_events', 'targets_log', 'logs',
+  'proc_overhead', 'bpf_stats', 'memory_events', 'oom_events', 'targets_log', 'logs',
   'deep_episodes', 'deep_series', 'deep_gap', 'deep_folded', 'deep_syscall', 'deep_lock',
-  'deep_runq', 'deep_iofile'];
+  'deep_runq', 'deep_iofile', 'net_stack', 'net_iface', 'net_softnet', 'gpu_device',
+  'cgroup', 'cgroup_io', 'deep_proc', 'deep_io_device', 'deep_net_flow', 'deep_net_drop',
+  'deep_net_softirq', 'deep_gpu_process', 'deep_offcpu'];
 const sys = tables.filter((t) => !t.startsWith('sqlite_'));
 check(JSON.stringify(sys.sort()) === JSON.stringify(expected.slice().sort()),
-  `22 张表 (${sys.length})`);
+  `34 张表 (${sys.length})`);
 
+// ---- v2 contract assertions (raw db, V.db wired below) ----
+const schemaVer = db.exec("SELECT value FROM meta WHERE key='schema_version'")[0].values[0][0];
+check(schemaVer === '2', `schema_version = '${schemaVer}'`);
+const hostCols = db.exec('PRAGMA table_info(host)')[0].values.map((r) => r[1]);
+check(!hostCols.includes('vm_free_pages') && !hostCols.includes('vm_anon_pages'),
+  'host 无 vm_free_pages/vm_anon_pages 列');
+const anomalyCols = db.exec('PRAGMA table_info(anomaly)')[0].values.map((r) => r[1]);
+check(!anomalyCols.includes('faults_total') && anomalyCols.includes('minor_faults_total') &&
+  anomalyCols.includes('major_faults_total'),
+  'anomaly 用 minor/major_faults_total 替代 faults_total');
+
+// net_iface counter delta: two ticks, rx_bytes strictly increasing.
+const ifaceRows = db.exec('SELECT ts_ns,rx_bytes FROM net_iface WHERE ifindex=1 ORDER BY ts_ns')[0].values;
+check(ifaceRows.length >= 2 && ifaceRows[1][1] > ifaceRows[0][1],
+  `net_iface rx_bytes 单调递增 (${ifaceRows.map((r) => r[1])})`);
+
+// gpu unavailable rows exist (available=0 must be recorded, not skipped).
+const gpuUnavail = db.exec('SELECT COUNT(*) FROM gpu_device WHERE available=0')[0].values[0][0];
+check(gpuUnavail > 0, `gpu_device.available=0 行数 = ${gpuUnavail}`);
+
+// deep evidence tables each have >= 1 row in the fixture.
+for (const t of ['deep_proc', 'deep_io_device', 'deep_net_flow', 'deep_net_drop',
+                 'deep_net_softirq', 'deep_gpu_process', 'deep_offcpu']) {
+  const n = db.exec(`SELECT COUNT(*) FROM ${t} WHERE ordinal=1`)[0].values[0][0];
+  check(n > 0, `${t} 行数 = ${n}`);
+}
 // ---- extraction / metrics ----
 // db.js is not loaded in node; wire V.db primitives onto the raw Database.
 V.db = { sqlJs: SQL };

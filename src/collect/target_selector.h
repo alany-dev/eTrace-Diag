@@ -51,8 +51,10 @@ class TargetSelector {
   uint32_t thread_budget() const { return thread_budget_; }
   const HardwareProbe& hw() const { return hw_; }
 
-  // One scoring/evaluation pass. Returns true if membership changed.
-  bool Evaluate(const Config& cfg);
+  // One scoring/evaluation pass over the process table already read by the
+  // host tick (no second iterator pass). Returns true if membership changed.
+  bool Evaluate(const Config& cfg, const std::vector<ProcessRow>& process_table,
+                uint64_t now_ns);
 
   const std::unordered_set<uint32_t>& member_threads() const { return members_; }
   const std::unordered_set<uint32_t>& member_processes() const { return procs_; }
@@ -84,10 +86,12 @@ class TargetSelector {
     double score = 0;
   };
 
-  Counters ReadTid(uint32_t tid);
+  // Per-tid counters: CPU/switch/fault deltas come from the monotonic
+  // process-table row; I/O and lock wait still come from the full per-tid
+  // block_io / lock_st maps (the only cold-start ranking source for IO/lock).
+  Counters ReadTid(uint32_t tid, const ProcessRow& proc);
   void Join(uint32_t tid, uint32_t tgid, double score, uint32_t proc_rank);
   void Leave(uint32_t tid, uint32_t proc_rank);
-  uint64_t NowNs() const;
 
   EbpfManager& ebpf_;
   OutputWriter& writer_;
@@ -98,6 +102,7 @@ class TargetSelector {
   std::unordered_set<uint32_t> members_;           // current target tids
   std::unordered_set<uint32_t> procs_;              // current selected tgids
   std::deque<Snapshot> history_;                    // sliding window
+  std::unordered_map<uint32_t, uint64_t> start_time_;  // tid -> start_time (pid-reuse break)
 };
 
 }  // namespace etrace_diag
