@@ -187,6 +187,10 @@ def fig_rankdist(rcaeval: dict, aiops: dict, out: Path):
     fig, axes = plt.subplots(1, 2, figsize=(11, 4.4), constrained_layout=True)
     bins = np.arange(1, 8) - 0.5  # rank 1..6+, last bin = >5
 
+    def clamp(r: int) -> int:
+        # rank <= 0 means root not found in ranking -> treat as >5
+        return 6 if (r <= 0 or r > 5) else r
+
     # RCAeval: rank distribution pooled over RE1-RE3
     ax = axes[0]
     for var, color in COLORS.items():
@@ -194,7 +198,7 @@ def fig_rankdist(rcaeval: dict, aiops: dict, out: Path):
         for suite in ("RE1", "RE2", "RE3"):
             for c in rcaeval[(suite, var)]["cases"].values():
                 if "rank" in c:
-                    ranks.append(min(c["rank"], 6))
+                    ranks.append(clamp(c["rank"]))
         counts, _ = np.histogram(ranks, bins=bins)
         ax.bar(np.arange(1, 7) + (0.4 if var == "improved" else -0.4), counts,
                width=0.4, color=color, label=VARIANT_CN[var])
@@ -208,7 +212,7 @@ def fig_rankdist(rcaeval: dict, aiops: dict, out: Path):
     # AIOps rank distribution
     ax = axes[1]
     for var, color in COLORS.items():
-        ranks = [min(c["rank"], 6) for c in aiops[var]["per_case"].values() if "rank" in c]
+        ranks = [clamp(c["rank"]) for c in aiops[var]["per_case"].values() if "rank" in c]
         counts, _ = np.histogram(ranks, bins=bins)
         ax.bar(np.arange(1, 7) + (0.4 if var == "improved" else -0.4), counts,
                width=0.4, color=color, label=VARIANT_CN[var])
