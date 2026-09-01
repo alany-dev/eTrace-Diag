@@ -20,9 +20,8 @@ never replace the primary metric.
 - p50 / p95 single-window inference latency (ms, edge reference CPU)
 - Peak RSS (MB)
 
-### Detectors compared
-
-`StreamingRobustDetector`, `FITSDetector`, `EdgeCascadeDetector` (this project).
+`StreamingRobustDetector`, `FITSDetector`, `EdgeCascadeDetector` (this project);
+`time_rcd` (external zero-shot baseline — see the zero-shot rule below).
 
 ### Experimental protocol
 
@@ -47,6 +46,43 @@ uv run python -m experiments.run_detection \
    — not function-level causal ground truth). The plan's `EdgeCascadeDetector`
    metric contributions are evaluated against `interpretation_label` direction
    and rank.
+
+### Zero-shot baseline rule (time_rcd, deviation documented)
+
+Time-RCD has no per-task training step, so the standard "thresholds from
+train/validation only" fit does not exist for it. Zero-shot-specific rules:
+
+- **VUS-PR is the headline metric** (threshold-free). Point/segment F1 is
+  reported at a FIXED 0.5 threshold declared prior (`--threshold`), calibrated
+  on nothing — never on test labels.
+- Modules that calibrate a threshold do so ONLY on SMD's per-machine TRAIN
+  file scores (`calibration_basis: "smd-train-contaminated"` recorded in every
+  such run's JSON). The SMD train file contains anomalies, so those thresholds
+  are contaminated by construction — the caveat is recorded, never hidden.
+  Test labels never participate in any calibration.
+- **SERIAL-ONLY rule for the module matrix**: `experiments/queue_time_rcd_modules.sh`
+  is the only supported runner; every experiment runs strictly one at a time
+  (plain sequential `run()` calls, no `&`, no `xargs -P`, no background jobs).
+  No parallel experiments are permitted — device resources are limited.
+
+Commands (SMD):
+
+```bash
+uv run python -m experiments.baselines.time_rcd --data-root data/smd \
+    --limit-machines 3 --module base --output results/time_rcd/base.json
+bash experiments/queue_time_rcd_modules.sh   # 27 runs, strictly serial
+```
+
+### Combination stage (time_rcd, user directive 2026-08-31)
+
+Ordering rule: **combine accuracy-winning modules into a model that beats
+`base` on VUS-PR FIRST; quantization (ptq-int8) and other lightweight
+variants come only after the combination stage wins.** Combination runs use
+the same zero-shot threshold rules and serial-only execution as the module
+matrix (`experiments/queue_time_rcd_combos.sh`, one run at a time, CPU only).
+Each combination is a fixed two-module chain of already-measured winners; no
+combination is re-run to cherry-pick.
+
 
 ### Contacted SOTA
 

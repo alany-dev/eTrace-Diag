@@ -26,7 +26,7 @@ implementation; this project targets Python 3.11.
 | ScatterAD | NeurIPS 2025 | precision reference (offline) | / | <https://github.com/jk-sounds/ScatterAD> | t.b.d. | multivariate → score | verify | pending |
 | KAN-AD | ICML 2025 | precision reference (offline) | / | <https://github.com/qzhou/KAN-AD> | t.b.d. | multivariate → score | verify | pending |
 | MOMENT | ICML 2024 | offline teacher / zero-shot transfer (never loaded at edge runtime) | <https://arxiv.org/abs/2402.03885> | <https://github.com/moment-timeseries-foundation-model/moment> | t.b.d. | series → embeddings/scores | MIT (verify) | pending |
-| Time-RCD | ICML 2026 | offline teacher / zero-shot per-timestep score contrast | / | <https://github.com/thu-sail-lab/Time-RCD> | t.b.d. | series → per-timestep score | verify | pending |
+| Time-RCD | ICML 2026 | primary Model-1 zero-shot baseline (0-sample generalization; module matrix in `time-rcd-module-results.md`) | <https://arxiv.org/abs/2509.21190> | <https://github.com/thu-sail-lab/Time-RCD> | `372bb980426b2f67007311c6f3165ab789c79bef` (uv.lock) | series → per-timestep score | Apache-2.0 (verified) | ok |
 | STAR | 2025 | state-conditioning reference (state identity / variable identity encoding, conditional adapter, numeric–state matching) | <https://arxiv.org/html/2510.16014v1> | — | — | time series + discrete state → conditioned scores | paper-only | reference |
 
 ### Model 1 design decisions
@@ -120,7 +120,8 @@ the items listed.
 
 | Component | Implementation | Backend | Verified result |
 |---|---|---|---|
-| Anomaly Transformer | official thuml model code (CUDA→CPU port, `output_attention=True`), this project's train loop + no-adjust metric | torch CPU | SMD 3-machine subset, 2 epochs: point F1 0.243 (no point-adjust), seg F1 0.746 |
+| Time-RCD (multi, zero-shot) | official `time_rcd` package + HF checkpoint `pretrain_checkpoint_best_multi` (win 5000, batch 1), no training, no labels | torch CPU | SMD 3-machine subset: point F1 0.305 (no adjust, fixed 0.5 prior), seg F1 0.7605, VUS-PR 0.383 (threshold-free headline) |
+| Time-RCD combo-fusion03-med5 (combination stage) | frozen checkpoint + robust-z fusion w=0.3 then median-k5 (numpy post-processing) | torch CPU | SMD 3-machine subset: point F1 0.3158, seg F1 0.8389, VUS-PR 0.5248 (headline +0.142 vs base); calibration basis smd-train-contaminated |
 
 ### Model 1 detection comparison (SMD: machine-1-1..1-3)
 
