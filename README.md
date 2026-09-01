@@ -31,6 +31,8 @@
 evaluation-protocol）。TORAI 架构详解（从零入门，基准版 vs 改进版逐模块）：
 `docs/research/torai-architecture.md`；实测指标详录（RCAeval RE1/RE2/RE3 +
 AIOps 2020，分故障/分系统/逐案例）：`docs/research/torai-benchmark-results.md`。
+TORAI 改进版报告（TORAI-QT：基准 vs 改进、创新点、配图与指标讲解）：
+`docs/research/torai-rca-report.md`。
 Time-RCD 改进模型报告（Time-RCD-Fuse：创新点、实验效果、指标讲解与配图）：
 `docs/research/time-rcd-fuse-report.md`；模块矩阵实测：
 `docs/research/time-rcd-module-results.md`。
