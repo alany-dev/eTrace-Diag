@@ -92,28 +92,51 @@ def _load_metric_table(inner_zip, csv_suffix: str) -> pd.DataFrame:
 
 
 def run(args) -> dict:
+    from experiments.torai_ablation_matrix import (
+        canonical_label_from_spec,
+        parse_modules,
+        screen_confirm_split,
+    )
+
+    module_cfg = parse_modules(args.modules)
+    modules_label = canonical_label_from_spec(args.modules)
+
     z = zipfile.ZipFile(args.archive)
     cat = z.read("故障整理（预赛）.csv").decode("utf-8", "replace")
     faults = list(csv.DictReader(io.StringIO(cat)))
     if args.object and args.object != "all":
         faults = [f for f in faults if f["object"] == args.object]
+
+    # ---- metadata-only screen/confirm split (per object group) ----
+    groups: dict[tuple, list[str]] = {}
+    for f in faults:
+        groups.setdefault((f["object"],), []).append(f["index"])
+    screen_ids, confirm_ids = screen_confirm_split(groups)
+    if args.stage == "screen":
+        faults = [f for f in faults if f["index"] in screen_ids]
+    elif args.stage == "confirm":
+        faults = [f for f in faults if f["index"] in confirm_ids]
     if args.limit:
         faults = faults[: args.limit]
 
-    rca = ToraiRCA({"torai": {"variant": args.variant}}, seed=args.seed)
-    per_case: dict[str, dict] = {}
+    rca = ToraiRCA({"torai": {**module_cfg, "variant": args.variant}}, seed=args.seed)
+    case_records: list[dict] = []
+    failures: list[dict] = []
+    latencies: list[float] = []
     t0 = time.time()
     for fi, f in enumerate(faults, 1):
         day = f["log_time"].split(" ")[0].split("/")
         day_zip_name = f"AIOps挑战赛数据/{day[0]}_{int(day[1]):02d}_{int(day[2]):02d}.zip"
         idx = f["index"]
         if day_zip_name not in z.namelist():
-            per_case[idx] = {"root": f["name"], "reason": f"missing {day_zip_name}"}
+            failures.append({"case": idx, "root": f["name"],
+                             "reason": f"missing {day_zip_name}"})
             continue
         inner = zipfile.ZipFile(io.BytesIO(z.read(day_zip_name)))
         csv_suffix = OBJECT_CSV.get(f["object"])
         if csv_suffix is None:
-            per_case[idx] = {"root": f["name"], "reason": f"no csv for object {f['object']}"}
+            failures.append({"case": idx, "root": f["name"],
+                             "reason": f"no csv for object {f['object']}"})
             continue
         metric = _load_metric_table(inner, csv_suffix)
         # bound RCD cost: keep top-N columns by variance when the pivot expands
@@ -122,54 +145,92 @@ def run(args) -> dict:
             keep = var.nlargest(args.max_cols).index.tolist()
             metric = metric[["time"] + keep]
         if len(metric) <= 2:
-            per_case[idx] = {"root": f["name"], "reason": "no docker metrics"}
+            failures.append({"case": idx, "root": f["name"], "reason": "no docker metrics"})
             continue
         inject_utc = _inject_utc_sec(f["log_time"])
         # daily zip covers only the local 00:00-06:00 window; faults outside it
         # have no metric coverage for the anomalous segment -> record, skip
         if (metric["time"] < inject_utc).sum() == 0 or (metric["time"] >= inject_utc).sum() == 0:
-            per_case[idx] = {"root": f["name"], "reason": "fault time outside metric window"}
+            failures.append({"case": idx, "root": f["name"],
+                             "reason": "fault time outside metric window"})
             continue
+        t_start = time.perf_counter()
         try:
             res = rca.analyze_tables(
                 metric, pd.DataFrame(columns=["time"]), None, None,
                 inject_ns=inject_utc * 1_000_000_000,
                 variant=args.variant,
             )
+            lat = time.perf_counter() - t_start
             ranks = [r[:-2] if r.endswith("_A") else r for r in res["service_ranks"]]
         except Exception as e:  # noqa: BLE001 - per-case robustness for survey
-            per_case[idx] = {"root": f["name"], "reason": f"{type(e).__name__}: {e}"}
+            failures.append({"case": idx, "root": f["name"],
+                             "reason": f"{type(e).__name__}: {e}"})
             continue
         root = _encode_instance(f["name"])
-        per_case[idx] = {
+        rank = (ranks.index(root) + 1) if root in ranks else -1
+        case_records.append({
+            "case": idx,
+            "object": f["object"],
             "root": f["name"],
             "root_enc": root,
+            "rank": rank,
             "top3": ranks[:3],
             "top5": ranks[:5],
-            "rank": (ranks.index(root) + 1) if root in ranks else -1,
-        }
-        print(f"  [{fi}/{len(faults)}] {f['name']} rank={per_case[idx]['rank']}", file=sys.stderr, flush=True)
+            "hit1": int(rank == 1),
+            "hit3": int(0 < rank <= 3),
+            "hit5": int(0 < rank <= 5),
+            "latency_s": round(lat, 4),
+            "module_evidence": res["module_evidence"],
+        })
+        latencies.append(lat)
+        print(f"  [{fi}/{len(faults)}] {f['name']} rank={rank}", file=sys.stderr, flush=True)
 
-    elapsed = time.time() - t0
-    n = sum(1 for c in per_case.values() if "rank" in c)
-    if n == 0:
-        return {"object": args.object, "variant": args.variant, "n_cases": 0,
-                "note": "no case had metric coverage"}
-    hit1 = sum(1 for c in per_case.values() if c.get("rank") == 1)
-    hit3 = sum(1 for c in per_case.values() if 0 < c.get("rank", 0) <= 3)
-    hit5 = sum(1 for c in per_case.values() if 0 < c.get("rank", 0) <= 5)
-    # RCAEval-style Avg@5 = (AC@1 + AC@3 + AC@5) / 3
-    avg5 = (hit1 + hit3 + hit5) / 3 / n
+    import math
+    import resource
+    peak_rss_mb = round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0, 1)
+    n_eval = len(case_records)
+    n_total = n_eval + len(failures)
+    hits = {k: sum(c[f"hit{k}"] for c in case_records) for k in (1, 3, 5)}
+    ac = {k: round(hits[k] / n_eval, 4) if n_eval else None for k in (1, 3, 5)}
+    avg5 = round((ac[1] + ac[3] + ac[5]) / 3, 4) if n_eval else None
+    p50 = p95 = None
+    if latencies:
+        slat = sorted(latencies)
+        p50 = round(slat[len(slat) // 2], 2)
+        p95 = round(slat[min(len(slat) - 1, int(math.ceil(0.95 * len(slat)) - 1))], 2)
+
+    by_object: dict[str, dict] = {}
+    for c in case_records:
+        e = by_object.setdefault(c["object"], {"n": 0, "hit1": 0, "hit3": 0, "hit5": 0})
+        e["n"] += 1
+        e["hit1"] += c["hit1"]; e["hit3"] += c["hit3"]; e["hit5"] += c["hit5"]
+    for g, e in by_object.items():
+        e.update({"ac@1": round(e["hit1"] / e["n"], 4),
+                  "ac@3": round(e["hit3"] / e["n"], 4),
+                  "ac@5": round(e["hit5"] / e["n"], 4),
+                  "avg@5": round((e["hit1"] + e["hit3"] + e["hit5"]) / 3 / e["n"], 4)})
+
     return {
+        "suite": "AIOPS",
         "object": args.object,
+        "stage": args.stage,
+        "modules": modules_label,
         "variant": args.variant,
-        "n_cases": n,
-        "ac@1": round(hit1 / n, 4),
-        "ac@3": round(hit3 / n, 4),
-        "ac@5": round(hit5 / n, 4),
-        "avg@5": round(avg5, 4),
-        "total_s": round(elapsed, 1),
-        "per_case": per_case,
+        "seed": args.seed,
+        "torai_config": {"variant": args.variant,
+                         **{k: getattr(rca.cfg, k) for k in rca.cfg.__dataclass_fields__}},
+        "n_total": n_total,
+        "n_evaluable": n_eval,
+        "n_failed": len(failures),
+        "coverage": round(n_eval / n_total, 4) if n_total else None,
+        "ac@1": ac[1], "ac@3": ac[3], "ac@5": ac[5], "avg@5": avg5,
+        "p50_s": p50, "p95_s": p95,
+        "total_s": round(time.time() - t0, 1),
+        "peak_rss_mb": peak_rss_mb,
+        "cases": case_records,
+        "failures": failures,
+        "by_object": by_object,
     }
 
 
@@ -177,16 +238,26 @@ def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--archive", required=True)
     p.add_argument("--object", default="docker", help="docker|os|db|all")
-    p.add_argument("--max-cols", type=int, default=200,
+    p.add_argument("--max-cols", type=int, default=50,
                    help="cap metric columns by variance (os/db expand to 600-1100 cols; RCD explodes)")
     p.add_argument("--variant", default="faithful", choices=["faithful", "improved"])
+    p.add_argument("--modules", default="none",
+                   help="comma-separated canonical modules tail,guided,onset,consensus "
+                        "(fixed order; empty or 'none' = baseline)")
+    p.add_argument("--stage", default="all", choices=["all", "screen", "confirm"],
+                   help="case selection: metadata-defined screen/confirm split")
+    p.add_argument("--output", default="", help="write the run JSON here")
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--seed", type=int, default=7)
     args = p.parse_args(argv)
     out = run(args)
+    if args.output:
+        Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.output).write_text(json.dumps(out, indent=2, ensure_ascii=False))
     print(json.dumps(out, indent=2, ensure_ascii=False))
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

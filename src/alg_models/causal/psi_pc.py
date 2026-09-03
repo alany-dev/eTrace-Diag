@@ -16,10 +16,11 @@ import warnings
 warnings.filterwarnings("ignore")  # reference parity: rcd.py ignores sklearn noise
 
 from itertools import combinations
+from typing import Sequence
 
 import numpy as np
 import pandas as pd
-from scipy.stats import chi2
+from scipy.special import gammaincc
 from sklearn.preprocessing import KBinsDiscretizer
 
 F_NODE = "F-node"
@@ -78,7 +79,7 @@ class MiniCausalGraph:
     def ci_test(self, i: int, j: int, S) -> float:
         self.no_ci_tests += 1
         i, j = (i, j) if i < j else (j, i)
-        key = (i, j, frozenset(S))
+        key = (i, j, tuple(sorted(set(S))))
         if key in self.citest_cache:
             return self.citest_cache[key]
         p = chisq_ci(self.data, i, j, S, cardinalities=self.cardinalities)
@@ -182,7 +183,10 @@ def _chi2_pvalue(count_tables: np.ndarray, expected_tables: np.ndarray) -> float
     zero_rows = e_zero.all(axis=2).sum(axis=1)
     zero_cols = e_zero.all(axis=1).sum(axis=1)
     dof = np.sum((count_tables.shape[1] - 1 - zero_rows) * (count_tables.shape[2] - 1 - zero_cols))
-    return 1.0 if dof == 0 else float(chi2.sf(stat, dof))
+    # chi2.sf(x, dof) == gammaincc(dof/2, x/2) exactly; the direct special
+    # function skips scipy.stats' dispatch/validation (~54us -> ~1us per call,
+    # measured on the 6.5k-call CI hot path).
+    return 1.0 if dof == 0 else float(gammaincc(dof / 2.0, stat / 2.0))
 
 
 # ---------------------------------------------------------------- discretize
@@ -215,7 +219,6 @@ def discretize(data: pd.DataFrame, bins: int, strategy: str = "kmeans") -> pd.Da
 
 # ---------------------------------------------------------------- skeleton
 
-
 def local_skeleton_discovery(
     data: np.ndarray,
     local_node: int,
@@ -223,6 +226,7 @@ def local_skeleton_discovery(
     mi=(),
     labels: dict[int, str] | None = None,
     seed: int | None = None,
+    priority: Sequence[str] | None = None,
 ) -> MiniCausalGraph:
     """Patched causal-learn ``local_skeleton_discovery``.
 
@@ -237,6 +241,10 @@ def local_skeleton_discovery(
     cg.cardinalities = np.max(cg.data, axis=0) + 1
 
     rng = np.random.RandomState(seed)
+    if priority is not None:
+        rank = {name: i for i, name in enumerate(priority)}
+    else:
+        rank = {}
     depth = -1
     x = local_node
     for i in mi:
@@ -245,7 +253,18 @@ def local_skeleton_discovery(
 
     while cg.max_degree() - 1 > depth:
         depth += 1
-        local_neigh = rng.permutation(cg.neighbors(x))
+        neigh = cg.neighbors(x)
+        if priority is not None:
+            # F-node neighbours in priority order; unlisted appended in
+            # original numeric order (labels may be None).
+            local_neigh = np.array(
+                sorted(
+                    (int(n) for n in neigh),
+                    key=lambda n: (rank.get(labels.get(int(n), ""), len(rank)), int(n)),
+                )
+            )
+        else:
+            local_neigh = rng.permutation(neigh)
         for y in local_neigh:
             y = int(y)
             neigh_y = cg.neighbors(y)
@@ -274,6 +293,7 @@ def skeleton_discovery(
     labels: dict[int, str] | None = None,
     stable: bool = False,
     seed: int | None = None,
+    priority: Sequence[str] | None = None,
 ) -> MiniCausalGraph:
     """Port of causal-learn ``skeleton_discovery`` (``stable=False`` path).
 
@@ -286,17 +306,32 @@ def skeleton_discovery(
     cg.cardinalities = np.max(cg.data, axis=0) + 1
 
     rng = np.random.RandomState(seed)  # deterministic tie-order, reference iterates 0..n
+    if priority is not None:
+        rank = {name: i for i, name in enumerate(priority)}
+        node_key = lambda n: (rank.get(labels.get(int(n), ""), len(rank)), int(n))
+    else:
+        rank = {}
+        node_key = None
     depth = -1
     while cg.max_degree() - 1 > depth:
         depth += 1
-        for x in range(n_features):
+        if node_key is not None:
+            x_order = sorted(range(n_features), key=node_key)
+        else:
+            x_order = range(n_features)
+        for x in x_order:
             neigh_x = cg.neighbors(x)
             if len(neigh_x) < depth - 1:
                 continue
-            for y in list(neigh_x):
+            y_order = sorted((int(n) for n in neigh_x), key=node_key) if node_key else list(neigh_x)
+            for y in y_order:
                 y = int(y)
                 neigh_x_noy = np.delete(neigh_x, np.where(neigh_x == y))
-                for S in combinations(sorted(int(s) for s in neigh_x_noy), depth):
+                if node_key is not None:
+                    s_order = sorted((int(s) for s in neigh_x_noy), key=node_key)
+                else:
+                    s_order = sorted(int(s) for s in neigh_x_noy)
+                for S in combinations(s_order, depth):
                     p = cg.ci_test(x, y, S)
                     if p > alpha:
                         edge1 = cg.graph[x, y]
@@ -339,6 +374,7 @@ def run_psi_pc(
     min_nodes: int = -1,
     seed: int | None = None,
     discretize_strategy: str = "kmeans",
+    priority: Sequence[str] | None = None,
 ) -> tuple[list[str], int]:
     """Run Ψ-PC on normal/anomalous frames; return (ranked columns, ci_tests).
 
@@ -369,10 +405,13 @@ def run_psi_pc(
     for a in np.arange(alpha, ALPHA_LIMIT, ALPHA_STEP):
         if localized:
             cg = local_skeleton_discovery(
-                data.to_numpy(), f_node, float(a), mi=processed_mi, labels=i_to_labels, seed=seed
+                data.to_numpy(), f_node, float(a), mi=processed_mi,
+                labels=i_to_labels, seed=seed, priority=priority,
             )
         else:
-            cg = skeleton_discovery(data.to_numpy(), float(a), labels=i_to_labels, seed=seed)
+            cg = skeleton_discovery(
+                data.to_numpy(), float(a), labels=i_to_labels, seed=seed, priority=priority
+            )
         no_ci += cg.no_ci_tests
 
         f_neigh = [int(n) for n in cg.successors(f_node)]
@@ -427,12 +466,17 @@ def run_level(
     bins: int,
     seed: int | None = None,
     discretize_strategy: str = "kmeans",
+    priority: Sequence[str] | None = None,
 ) -> tuple[list[str], int]:
     """Phase-1: one level of chunked Ψ-PC; union of F-node children."""
     ci_tests = 0
     chunks = create_chunks(normal_df, gamma, seed=seed)
     f_child_union: list[str] = []
     for c in chunks:
+        chunk_priority = None
+        if priority is not None:
+            cset = set(c)
+            chunk_priority = [n for n in priority if n in cset] or None
         rc, ci = run_psi_pc(
             normal_df.loc[:, c],
             anomal_df.loc[:, c],
@@ -442,6 +486,7 @@ def run_level(
             min_nodes=1,
             seed=seed,
             discretize_strategy=discretize_strategy,
+            priority=chunk_priority,
         )
         f_child_union += rc
         ci_tests += ci
@@ -456,6 +501,7 @@ def run_multi_phase(
     bins: int = 5,
     seed: int | None = None,
     discretize_strategy: str = "kmeans",
+    priority: Sequence[str] | None = None,
 ) -> list[str]:
     """Full RCD: phase-1 shrink loop + phase-2 ordering; returns root causes."""
     f_child_union = list(normal_df.columns)
@@ -471,6 +517,7 @@ def run_multi_phase(
             bins,
             seed=seed,
             discretize_strategy=discretize_strategy,
+            priority=priority,
         )
         i += 1
         len_child = len(f_child_union)
@@ -487,5 +534,6 @@ def run_multi_phase(
         localized=localized,
         seed=seed,
         discretize_strategy=discretize_strategy,
+        priority=priority,
     )
     return rc

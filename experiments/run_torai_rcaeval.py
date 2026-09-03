@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import re
 import sys
 import time
@@ -154,7 +155,13 @@ def main(argv=None) -> int:
     p.add_argument("--data", default="data/rcaeval")
     p.add_argument("--suite", default="RE1", choices=["RE1", "RE2", "RE3"])
     p.add_argument("--variant", default="faithful", choices=["faithful", "improved"])
-    p.add_argument("--seeds", default="7")
+    p.add_argument("--modules", default="none",
+                   help="comma-separated canonical modules tail,guided,onset,consensus "
+                        "(fixed order; empty or 'none' = baseline)")
+    p.add_argument("--seed", type=int, default=7, help="single seed per process")
+    p.add_argument("--stage", default="all", choices=["all", "screen", "confirm"],
+                   help="case selection: metadata-defined screen/confirm split")
+    p.add_argument("--output", default="", help="write the run JSON here")
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--start", type=int, default=0, help="skip first N cases (resume)")
     p.add_argument("--out-cases", default="", help="write per-case results JSON here")
@@ -162,23 +169,43 @@ def main(argv=None) -> int:
     p.add_argument("--traces", action="store_true", help="include traces modality (RE2/RE3 OB/TT)")
     args = p.parse_args(argv)
 
+    from experiments.torai_ablation_matrix import (
+        canonical_label_from_spec,
+        parse_modules,
+        screen_confirm_split,
+    )
+
+    module_cfg = parse_modules(args.modules)
+    modules_label = canonical_label_from_spec(args.modules)
+
     root = Path(args.data)
     cases = pd.read_parquet(root / "cases.parquet")
     suite = cases[cases["suite"] == args.suite]
+
+    # ---- metadata-only screen/confirm split (per (system, fault) group) ----
+    groups: dict[tuple, list[str]] = {}
+    for _, row in suite.iterrows():
+        groups.setdefault((row["system"], row["fault"]), []).append(row["case"])
+    screen_ids, confirm_ids = screen_confirm_split(groups)
+    if args.stage == "screen":
+        suite = suite[suite["case"].isin(screen_ids)]
+    elif args.stage == "confirm":
+        suite = suite[suite["case"].isin(confirm_ids)]
     if args.start:
         suite = suite.iloc[args.start:]
     if args.limit:
         suite = suite.head(args.limit)
 
-    seeds = [int(s) for s in args.seeds.split(",")]
-    rca = ToraiRCA({"torai": {"variant": args.variant}}, seed=seeds[0])
+    rca = ToraiRCA({"torai": {**module_cfg, "variant": args.variant}}, seed=args.seed)
     row_map = {r["case"]: r for _, r in suite.iterrows()}
-    hits = {k: [] for k in (1, 3, 5)}
-    per_case: dict[str, dict] = {}
+    case_records: list[dict] = []
+    failures: list[dict] = []
+    latencies: list[float] = []
     t0 = time.time()
     for _, row in suite.iterrows():
         case_dir = root / row["case"]
         inj = int(row["inject_time"])
+        t_start = time.perf_counter()
         try:
             tables = load_case(case_dir, inj, args.logs, args.traces)
             res = rca.analyze_tables(
@@ -186,60 +213,100 @@ def main(argv=None) -> int:
                 tables["tracets_err"], tables["tracets_lat"],
                 inject_ns=inj * 1_000_000_000, variant=args.variant,
             )
+            lat = time.perf_counter() - t_start
             ranks = [r[:-2] if r.endswith("_A") else r for r in res["service_ranks"]]
             if not ranks:
-                per_case[row["case"]] = {"root": row["root_cause_service"],
-                                         "reason": "empty severity matrix (no signal)"}
+                failures.append({"case": row["case"], "root": row["root_cause_service"],
+                                 "reason": "empty severity matrix (no signal)"})
                 continue
         except Exception as e:  # noqa: BLE001
-            per_case[row["case"]] = {"root": row["root_cause_service"], "reason": f"{type(e).__name__}: {e}"}
+            lat = time.perf_counter() - t_start
+            failures.append({"case": row["case"], "root": row["root_cause_service"],
+                             "reason": f"{type(e).__name__}: {e}"})
             continue
         ev = evaluate(ranks, row["root_cause_service"])
-        for k in (1, 3, 5):
-            hits[k].append(ev[k])
-        per_case[row["case"]] = {"root": row["root_cause_service"], "top3": ranks[:3],
-                                 "rank": (ranks.index(row["root_cause_service"]) + 1
-                                          if row["root_cause_service"] in ranks else -1),
-                                 "system": row["system"], "fault": row["fault"],
-                                 "hit1": ev[1], "hit3": ev[3], "hit5": ev[5]}
-        if len(hits[1]) % 10 == 0:
-            print(f"  [{len(hits[1])}/{len(suite)}] {row['case']} rank={per_case[row['case']]['rank']}",
+        rank = (ranks.index(row["root_cause_service"]) + 1
+                if row["root_cause_service"] in ranks else -1)
+        case_records.append({
+            "case": row["case"],
+            "root": row["root_cause_service"],
+            "system": row["system"],
+            "fault": row["fault"],
+            "rank": rank,
+            "top3": ranks[:3],
+            "hit1": ev[1], "hit3": ev[3], "hit5": ev[5],
+            "latency_s": round(lat, 4),
+            "module_evidence": res["module_evidence"],
+        })
+        latencies.append(lat)
+        if len(case_records) % 10 == 0:
+            print(f"  [{len(case_records)}/{len(suite)}] {row['case']} rank={rank}",
                   file=sys.stderr, flush=True)
 
-    n = len(hits[1]) or 1
-    ac = {k: round(sum(v) / n, 4) for k, v in hits.items()}
-    avg5 = round((ac[1] + ac[3] + ac[5]) / 3, 4)
+    import resource
+    peak_rss_mb = round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0, 1)
+    n_eval = len(case_records)
+    n_total = n_eval + len(failures)
+    hits = {k: sum(c[f"hit{k}"] for c in case_records) for k in (1, 3, 5)}
+    ac = {k: round(hits[k] / n_eval, 4) if n_eval else None for k in (1, 3, 5)}
+    avg5 = round((ac[1] + ac[3] + ac[5]) / 3, 4) if n_eval else None
+    p50 = p95 = None
+    if latencies:
+        slat = sorted(latencies)
+        p50 = round(slat[len(slat) // 2], 2)
+        p95 = round(slat[min(len(slat) - 1, int(math.ceil(0.95 * len(slat)) - 1))], 2)
 
     def _agg(key):
-        groups: dict = {}
-        for c, v in per_case.items():
-            if "rank" not in v or v["rank"] < 0:
-                continue
-            g = row_map.get(c, {}).get(key, "?")
-            e = groups.setdefault(g, {"n": 0, "hit1": 0, "hit3": 0, "hit5": 0})
+        groups_out: dict = {}
+        for c in case_records:
+            g = row_map.get(c["case"], {}).get(key, "?")
+            e = groups_out.setdefault(g, {"n": 0, "hit1": 0, "hit3": 0, "hit5": 0})
             e["n"] += 1
-            e["hit1"] += v["hit1"]; e["hit3"] += v["hit3"]; e["hit5"] += v["hit5"]
+            e["hit1"] += c["hit1"]; e["hit3"] += c["hit3"]; e["hit5"] += c["hit5"]
         out = {}
-        for g, e in groups.items():
+        for g, e in groups_out.items():
             out[g] = {"n": e["n"],
                       "ac@1": round(e["hit1"] / e["n"], 4),
                       "ac@3": round(e["hit3"] / e["n"], 4),
                       "ac@5": round(e["hit5"] / e["n"], 4),
                       "avg@5": round((e["hit1"] + e["hit3"] + e["hit5"]) / 3 / e["n"], 4)}
         return out
+
     out = {
-        "suite": args.suite, "variant": args.variant, "seeds": args.seeds,
-        "n_cases": n, "total": len(suite),
+        "suite": args.suite,
+        "stage": args.stage,
+        "modules": modules_label,
+        "variant": args.variant,
+        "seed": args.seed,
+        "torai_config": {"variant": args.variant,
+                         **{k: getattr(rca.cfg, k) for k in rca.cfg.__dataclass_fields__}},
+        "n_total": n_total,
+        "n_evaluable": n_eval,
+        "n_failed": len(failures),
+        "coverage": round(n_eval / n_total, 4) if n_total else None,
         "ac@1": ac[1], "ac@3": ac[3], "ac@5": ac[5], "avg@5": avg5,
+        "p50_s": p50, "p95_s": p95,
         "total_s": round(time.time() - t0, 1),
-        "modalities": "metric" + ("+log" if args.logs else "") + ("+trace" if args.traces else ""),
-        "failures": [{"case": c, **v} for c, v in per_case.items() if "reason" in v],
+        "peak_rss_mb": peak_rss_mb,
+        "cases": case_records,
+        "failures": failures,
         "by_fault": _agg("fault"),
         "by_system": _agg("system"),
+        "modalities": "metric" + ("+log" if args.logs else "") + ("+trace" if args.traces else ""),
     }
     if args.out_cases:
+        per_case = {}
+        for c in case_records:
+            per_case[c["case"]] = {"root": c["root"], "top3": c["top3"], "rank": c["rank"],
+                                   "system": c["system"], "fault": c["fault"],
+                                   "hit1": c["hit1"], "hit3": c["hit3"], "hit5": c["hit5"]}
+        for f in failures:
+            per_case[f["case"]] = {"root": f["root"], "reason": f["reason"]}
         Path(args.out_cases).write_text(json.dumps(per_case, indent=2))
-    print(json.dumps({k: v for k, v in out.items() if k != "per_case"}, indent=2))
+    if args.output:
+        Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.output).write_text(json.dumps(out, indent=2))
+    print(json.dumps(out, indent=2))
     return 0
 
 

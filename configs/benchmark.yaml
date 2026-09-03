@@ -35,7 +35,12 @@ torai:
   random_state: 0
   gmm_max_iter: 50
   normal_post_trim: 15
-  variant: improved       # faithful|improved
+  severity_method: zmax      # zmax | empirical_tail (tail)
+  guided_ci: false           # guided
+  temporal_precedence: false # onset
+  rcd_consensus: false       # consensus
+  rcd_consensus_windows: 3   # fixed
+  variant: improved          # faithful|improved
 
 compute:
   profile: quick              # smoke|quick|standard|full

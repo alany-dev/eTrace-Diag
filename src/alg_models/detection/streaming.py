@@ -41,6 +41,7 @@ class StreamingRobustDetector(BaseDetector):
         self.thresholds: dict[tuple[str, str], float] = {}
         self.sample_interval_ns: int = 10_000_000_000
         self._fit_done = False
+        self._ewma_state: dict[tuple[str, str], float] = {}
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -84,6 +85,26 @@ class StreamingRobustDetector(BaseDetector):
             thresholds=self._threshold_map(),
             state={"ewma_alpha": self.ewma_alpha, "pot_quantile": self.pot_quantile},
         )
+    def observe_point(self, point) -> tuple[bool, dict[str, float], dict[str, str]]:
+        """Per-point streaming update: robust_z → EWMA → threshold. Returns
+        (is_anomalous, scores, directions). Never re-scores whole frames."""
+        if not self._fit_done or self.normalizer is None:
+            return False, {}, {}
+        stats = self.normalizer.per_metric.get((point.entity_id, point.metric_id))
+        if stats is None or point.value is None or point.quality != "observed":
+            return False, {}, {}
+        key = (point.entity_id, point.metric_id)
+        z = stats.robust_z(float(point.value))
+        ewma = self._ewma_state.get(key)
+        ewma = z if ewma is None else self.ewma_alpha * z + (1 - self.ewma_alpha) * ewma
+        self._ewma_state[key] = float(ewma)
+        thr = self._apply_adjustment(point.metric_id, self.thresholds.get(key, 4.0))
+        if abs(ewma) > thr:
+            score = min(1.0, abs(ewma) / max(thr, 1e-9))
+            direction = "up" if ewma > 0 else "down"
+            return True, {point.metric_id: score}, {point.metric_id: direction}
+        return False, {}, {}
+
 
     def score(self, frame: TelemetryFrame, *, state: TelemetryFrame | None = None) -> list[IncidentWindow]:
         if not self._fit_done or self.normalizer is None:

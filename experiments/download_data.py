@@ -37,6 +37,19 @@ DATASETS = {
         "license": "MIT (verify in repo)",
         "note": "RE1/RE2/RE3 suites; 9 datasets, 735 failure cases",
     },
+    "causaltime": {
+        "url": "https://github.com/jarrycyx/UNN",
+        "in_archive": None,
+        "license": "MIT (code); datasets at www.causaltime.cc",
+        "note": "known-graph temporal benchmark (arXiv:2310.01753, ICLR 2024); "
+                "graph.npy is the NxN coupling core, data is (S,T,2N)",
+    },
+    "causeme": {
+        "url": "https://webdav.tuebingen.mpg.de/causeme/",
+        "in_archive": None,
+        "license": "academic (verify before use)",
+        "note": "ABANDONED: platform registration/login paused; no known-graph split obtainable",
+    },
 }
 
 

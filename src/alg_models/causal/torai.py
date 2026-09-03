@@ -10,6 +10,7 @@ The public API:
     ToraiRCA(cfg_dict, seed=7).analyze(frame, train, val, ...) -> CausalReport
 """
 
+import math
 import warnings
 
 warnings.filterwarnings("ignore")  # reference parity: RCAEval torai.py ignores sklearn noise
@@ -47,6 +48,20 @@ class ToraiConfig:
     random_state: int = 0
     gmm_max_iter: int = 50
     normal_post_trim: int = 0  # drop normal-tail rows (improved: delay-polluted normal)
+    # ---- ablation module switches (default off => exact current behaviour) ----
+    severity_method: str = "zmax"  # "zmax" | "empirical_tail"
+    guided_ci: bool = False
+    temporal_precedence: bool = False
+    rcd_consensus: bool = False
+    rcd_consensus_windows: int = 3
+
+    def __post_init__(self) -> None:
+        if self.severity_method not in {"zmax", "empirical_tail"}:
+            raise ValueError(
+                f"severity_method must be zmax|empirical_tail, got {self.severity_method!r}"
+            )
+        if self.rcd_consensus_windows != 3:
+            raise ValueError("rcd_consensus_windows must be 3 (fixed compute budget)")
 
 
 # ---------------------------------------------------------------------------
@@ -57,11 +72,40 @@ def severity_scores(
     normal: pd.DataFrame,
     anomal: pd.DataFrame,
     scaler: str = "standard",
+    method: str = "zmax",
 ) -> list[tuple[str, float]]:
-    """Per-column max-|z| severity, normalized to sum 1 (reference parity)."""
+    """Per-column severity, normalized to sum 1.
+
+    ``zmax`` keeps the vectorized mean/std max-|z| (reference parity).
+    ``empirical_tail`` scores each column from the normal window alone:
+    center = median(normal), d = |normal - center|, d* = max|anomal - center|,
+    p = (1 + count(d >= d*)) / (n_normal + 1), raw severity = -log(p);
+    post-inject values only enter d* (never fit center/reference).
+    """
+    if method not in {"zmax", "empirical_tail"}:
+        raise ValueError(f"unknown severity method {method!r}")
     if normal is None or anomal is None or normal.empty or anomal.empty:
         return []
     cols = list(normal.columns)
+    if method == "empirical_tail":
+        result: list[tuple[str, float]] = []
+        for col in cols:
+            if col not in anomal.columns:
+                continue
+            nv = normal[col].to_numpy(dtype=np.float64)
+            av = anomal[col].to_numpy(dtype=np.float64)
+            nv = nv[np.isfinite(nv)]
+            av = av[np.isfinite(av)]
+            if nv.size == 0 or av.size == 0:
+                continue
+            center = float(np.median(nv))
+            d = np.abs(nv - center)
+            dstar = float(np.max(np.abs(av - center)))
+            p = (1.0 + float(np.count_nonzero(d >= dstar))) / (nv.size + 1.0)
+            result.append((col, -np.log(p)))
+        result.sort(key=lambda x: x[1], reverse=True)
+        total = sum(s for _, s in result) or 1.0
+        return [(col, s / total) for col, s in result]
     a = normal.to_numpy(dtype=np.float64, na_value=0.0)
     b = anomal.to_numpy(dtype=np.float64, na_value=0.0)
     if scaler == "robust":
@@ -82,7 +126,100 @@ def severity_scores(
     total = sum(s for _, s in result) or 1.0
     return [(col, s / total) for col, s in result]
 
+def top2_mean(fine_ranks: list[tuple[str, float]]) -> dict[str, float]:
+    """Per-service mean of top-2 indicator scores (count-robust aggregation).
 
+    A service with many weak indicators must not outrank a service with one
+    strong indicator just because its indicator count is larger: sums
+    (``fine2coarse_addup``) scale with count, top-2 mean does not.
+    """
+    per: dict[str, list[float]] = {}
+    for col, score in fine_ranks:
+        per.setdefault(col.split("_")[0], []).append(score)
+    out: dict[str, float] = {}
+    for svc, scores in per.items():
+        top2 = sorted(scores, reverse=True)[:2]
+        out[svc] = float(np.mean(top2)) if top2 else 0.0
+    return out
+
+
+def temporal_precedence_scores(
+    metric: pd.DataFrame, inject_s: int, services: list[str]
+) -> dict[str, float]:
+    """Per-service onset precedence on the resampled metric table.
+
+    Each column fits mean/std from ``time < inject_s`` only; the post segment
+    reports the first index with ``abs(z) >= 2.0`` sustained over two
+    consecutive samples (no sustained trigger -> post length). A service's
+    onset is the minimum over its indicators. Precedence is linear in onset:
+    earliest = 1, latest = 0 (ties share the value = average rank). Returns
+    {} when fewer than two valid services or all onsets equal (no-op).
+    """
+    if "time" not in metric.columns or metric.empty or len(services) < 2:
+        return {}
+    onsets: dict[str, float] = {}
+    for svc in services:
+        cols = [
+            c
+            for c in metric.columns
+            if c != "time" and (c == svc or c.startswith(svc + "_"))
+        ]
+        svc_onsets: list[float] = []
+        for c in cols:
+            pre = metric.loc[metric["time"] < inject_s, c].to_numpy(dtype=np.float64)
+            post = metric.loc[metric["time"] >= inject_s, c].to_numpy(dtype=np.float64)
+            pre = pre[np.isfinite(pre)]
+            post = post[np.isfinite(post)]
+            if pre.size == 0 or post.size == 0:
+                continue
+            center = float(np.mean(pre))
+            scale = float(np.std(pre))
+            if scale == 0:
+                scale = 1.0
+            z = np.abs((post - center) / scale)
+            onset: float | None = None
+            for i in range(z.size - 1):
+                if z[i] >= 2.0 and z[i + 1] >= 2.0:
+                    onset = float(i)
+                    break
+            svc_onsets.append(onset if onset is not None else float(post.size))
+        if svc_onsets:
+            onsets[svc] = min(svc_onsets)
+    if len(onsets) < 2:
+        return {}
+    if len(set(onsets.values())) == 1:
+        return {}
+    lo, hi = min(onsets.values()), max(onsets.values())
+    return {svc: float((hi - o) / (hi - lo)) for svc, o in onsets.items()}
+
+
+def _module_evidence(
+    cfg: ToraiConfig,
+    *,
+    temporal_scores: dict[str, float],
+    consensus_support: dict[str, float],
+    no_op: list[str],
+) -> dict:
+    """Internal module evidence dict (ignored by analyze() -> CausalReport)."""
+    parts = []
+    if cfg.severity_method == "empirical_tail":
+        parts.append("tail")
+    if cfg.guided_ci:
+        parts.append("guided")
+    if cfg.temporal_precedence:
+        parts.append("onset")
+    if cfg.rcd_consensus:
+        parts.append("consensus")
+    return {
+        "modules": "+".join(parts) or "none",
+        "severity_method": cfg.severity_method,
+        "guided_ci": cfg.guided_ci,
+        "temporal_precedence": cfg.temporal_precedence,
+        "temporal_scores": temporal_scores,
+        "rcd_consensus": cfg.rcd_consensus,
+        "consensus_support": consensus_support,
+        "no_op": no_op,
+    }
 # ---------------------------------------------------------------------------
 # Fine-to-coarse aggregation
 # ---------------------------------------------------------------------------
@@ -125,6 +262,7 @@ def symptom_cluster(
     n = X.shape[0]
     max_comp = min(n, cfg.n_components_max) if cfg.n_components_max is not None else n
     bics: list[float] = []
+    fitted: dict[int, GaussianMixture] = {}
     for n_comp in range(1, max_comp + 1):
         gmm = GaussianMixture(
             n_components=n_comp,
@@ -133,15 +271,12 @@ def symptom_cluster(
             random_state=cfg.random_state,
         )
         gmm.fit(X)
+        fitted[n_comp] = gmm
         bics.append(gmm.bic(X))
     best = int(np.argmin(bics)) + 1
-    gmm = GaussianMixture(
-        n_components=best,
-        covariance_type=cfg.covariance_type,
-        max_iter=cfg.gmm_max_iter,
-        random_state=cfg.random_state,
-    )
-    gmm.fit(X)
+    # reuse the BIC-best estimator from the scan instead of refitting an
+    # identical one (same params/data/seed -> identical labels; saves 1 fit)
+    gmm = fitted[best]
     labels = gmm.predict(X)
     mean_scores = np.mean(X, axis=1)
     cluster_rank: list[tuple[int, float]] = []
@@ -288,7 +423,6 @@ class ToraiRCA:
     ``cfg`` is a dict; the ``torai`` key holds ``ToraiConfig`` overrides and the
     optional ``variant`` key selects faithful/improved defaults.
     """
-
     def __init__(self, cfg: dict, *, seed: int = 7):
         tc = cfg.get("torai", {}) if isinstance(cfg, dict) else {}
         if not isinstance(tc, dict):
@@ -299,15 +433,6 @@ class ToraiRCA:
         self.seed = seed
         self._full_cfg = cfg if isinstance(cfg, dict) else {}
 
-    def __init__(self, cfg: dict, *, seed: int = 7):
-        tc = cfg.get("torai", {}) if isinstance(cfg, dict) else {}
-        if not isinstance(tc, dict):
-            tc = {}
-        # variant is consumed at the pipeline level, not by ToraiConfig
-        tc_inner = {k: v for k, v in tc.items() if k != "variant"}
-        self.cfg = ToraiConfig(**tc_inner)
-        self.seed = seed
-        self._full_cfg = cfg if isinstance(cfg, dict) else {}
 
     # -- detection (ported from graph_rca.py, Model 1 reuse) ---------------
 
@@ -414,6 +539,32 @@ class ToraiRCA:
             and len(traces_lat) > 0
         )
 
+        # Lightweight speedup: BLAS/OpenMP thread pools default to one thread per
+        # core (64 here); for these small matrices the oversubscription burns CPU
+        # (measured: 68 s CPU vs 5.6 s wall on the heaviest RE2 case) and makes
+        # latency erratic under load. Capping to 4 threads measured fastest and
+        # produces identical rankings/evidence (verified on the RE1 subset and the
+        # heaviest RE2 confirm case, ranks byte-equal across limits 1/2/4/64).
+        from threadpoolctl import threadpool_limits
+        with threadpool_limits(limits=4):
+            return self._analyze_tables_impl(
+                cfg, has_traces, metric, logts, traces_err, traces_lat,
+                inject_ns, variant,
+            )
+
+    def _analyze_tables_impl(
+        self,
+        cfg: ToraiConfig,
+        has_traces: bool,
+        metric: pd.DataFrame,
+        logts: pd.DataFrame,
+        traces_err: pd.DataFrame | None,
+        traces_lat: pd.DataFrame | None,
+        inject_ns: int,
+        variant: str,
+    ) -> dict:
+        # (body of the former analyze_tables — unchanged pipeline semantics)
+
         # ---- metric ----
         inject_s = inject_ns // 1_000_000_000
         if cfg.normal_post_trim:
@@ -454,13 +605,13 @@ class ToraiRCA:
             anomal_tl = _drop_time(traces_lat[traces_lat["time"] >= inject_s])
 
         # ---- severity ----
-        metric_ranks = severity_scores(normal_metric, anomal_metric, cfg.scaler)
-        log_ranks = severity_scores(normal_logts, anomal_logts, cfg.scaler)
+        metric_ranks = severity_scores(normal_metric, anomal_metric, cfg.scaler, method=cfg.severity_method)
+        log_ranks = severity_scores(normal_logts, anomal_logts, cfg.scaler, method=cfg.severity_method)
         trace_err_ranks: list[tuple[str, float]] = []
         trace_lat_ranks: list[tuple[str, float]] = []
         if has_traces:
-            trace_err_ranks = severity_scores(normal_te, anomal_te, cfg.scaler)
-            trace_lat_ranks = severity_scores(normal_tl, anomal_tl, cfg.scaler)
+            trace_err_ranks = severity_scores(normal_te, anomal_te, cfg.scaler, method=cfg.severity_method)
+            trace_lat_ranks = severity_scores(normal_tl, anomal_tl, cfg.scaler, method=cfg.severity_method)
 
         svc_metric_ranks = fine2coarse_addup(metric_ranks)
         svc_log_ranks = fine2coarse_highest(log_ranks)
@@ -507,19 +658,56 @@ class ToraiRCA:
                 "severity_matrix": {},
                 "indicator_ranks": {},
                 "limitations": ["no evaluable service (all metrics constant)"],
+                "module_evidence": _module_evidence(
+                    cfg, temporal_scores={}, consensus_support={},
+                    no_op=["no evaluable service (all metrics constant)"],
+                ),
             }
+
+        # ---- onset precedence fusion (onset module) ----
+        temporal_scores: dict[str, float] = {}
+        no_op: list[str] = []
+        if cfg.temporal_precedence:
+            temporal_scores = temporal_precedence_scores(metric, inject_s, service_list)
+            if not temporal_scores:
+                no_op.append("temporal_precedence:no-op(<2 valid services or all onsets equal)")
 
         # ---- clustering ----
         labels, cluster_rank = symptom_cluster(X, service_list, cfg)
 
+        # ---- onset fusion: 0.75 * base severity mean + 0.25 * precedence ----
+        fused_scores: dict[str, float] | None = None
+        if cfg.temporal_precedence and temporal_scores:
+            base = top2_mean(metric_ranks)
+            mean_scores = {
+                svc: float(s) for svc, s in zip(service_list, np.mean(X, axis=1))
+            }
+            fused_scores = {
+                svc: 0.75 * base.get(svc, mean_scores[svc])
+                + 0.25 * temporal_scores.get(svc, 0.0)
+                for svc in service_list
+            }
+            cluster_rank = []
+            for cl in set(labels):
+                idx = np.where(labels == cl)[0]
+                cluster_rank.append(
+                    (int(cl), float(np.mean([fused_scores[service_list[i]] for i in idx])))
+                )
+            cluster_rank.sort(key=lambda x: x[1], reverse=True)
+
         # ---- per-cluster refinement (reference parity) ----
+        consensus_support: dict[str, float] = {}
         service_ranks_rcd: list[str] = []
         cluster_labels_out: list[int] = []
         cluster_scores_out: list[tuple[int, float]] = []
         for cl_idx, cl_score in cluster_rank:
             idx = np.where(labels == cl_idx)[0]
             services_of_cluster = [service_list[i] for i in idx]
-            scores_of_them = np.mean(X, axis=1)[idx]
+            if fused_scores is not None:
+                scores_of_them = [fused_scores[s] for s in services_of_cluster]
+            else:
+                scores_of_them = np.mean(X, axis=1)[idx]
+
             cluster_labels_out.append(int(cl_idx))
             cluster_scores_out.append((int(cl_idx), float(cl_score)))
 
@@ -539,22 +727,39 @@ class ToraiRCA:
             if "time" in logts.columns:
                 tmp_logts["time"] = logts["time"]
 
-            tmp_ranks = self._rcd_multimodal(
-                {"metric": tmp_metric, "logts": tmp_logts},
-                inject_ns,
-                dataset=None,
-                gamma=cfg.gamma,
-                localized=cfg.localized,
-                bins=cfg.bins,
-                discretize_strategy=cfg.discretize_strategy,
-            )
-            tmp_ranks = [s.split("_")[0] for s in tmp_ranks]
-            internal = []
-            if tmp_ranks:
-                internal = [tmp_ranks[0]]
-                for s in tmp_ranks[1:]:
-                    if s not in internal:
-                        internal.append(s)
+            if cfg.rcd_consensus:
+                internal, support = self._rcd_consensus(
+                    {"metric": tmp_metric, "logts": tmp_logts},
+                    inject_ns,
+                    aa=aa,
+                    resample_s=cfg.resample_s,
+                    windows=cfg.rcd_consensus_windows,
+                    gamma=cfg.gamma,
+                    localized=cfg.localized,
+                    bins=cfg.bins,
+                    discretize_strategy=cfg.discretize_strategy,
+                )
+                consensus_support.update(support)
+                if not support:
+                    no_op.append("rcd_consensus:all-views-failed")
+            else:
+                tmp_ranks = self._rcd_multimodal(
+                    {"metric": tmp_metric, "logts": tmp_logts},
+                    inject_ns,
+                    dataset=None,
+                    gamma=cfg.gamma,
+                    localized=cfg.localized,
+                    bins=cfg.bins,
+                    discretize_strategy=cfg.discretize_strategy,
+                    resample_s=cfg.resample_s,
+                )
+                tmp_ranks = [s.split("_")[0] for s in tmp_ranks]
+                internal = []
+                if tmp_ranks:
+                    internal = [tmp_ranks[0]]
+                    for s in tmp_ranks[1:]:
+                        if s not in internal:
+                            internal.append(s)
 
             if len(internal) == len(services_of_cluster):
                 # RCD ordering replaces severity ordering within the cluster
@@ -598,6 +803,12 @@ class ToraiRCA:
             "severity_matrix": severity_matrix,
             "indicator_ranks": indicator_ranks,
             "limitations": limitations,
+            "module_evidence": _module_evidence(
+                cfg,
+                temporal_scores=temporal_scores,
+                consensus_support=consensus_support,
+                no_op=no_op,
+            ),
         }
 
     def _rcd_multimodal(
@@ -609,13 +820,15 @@ class ToraiRCA:
         localized: bool = True,
         bins: int = 5,
         discretize_strategy: str = "kmeans",
+        resample_s: int = 15,
+        seed: int | None = None,
     ) -> list[str]:
         """RCD on a metric+logts cluster subset (faithful port)."""
         metric = data["metric"]
         logts = data["logts"]
         inject_s = inject_ns // 1_000_000_000
 
-        metric = metric.iloc[::15, :]
+        metric = metric.iloc[::resample_s, :]
         normal_metric = metric[metric["time"] < inject_s]
         anomal_metric = metric[metric["time"] >= inject_s]
         normal_metric = _preprocess(normal_metric)
@@ -640,15 +853,122 @@ class ToraiRCA:
         if normal_df.empty or anomal_df.empty:
             return []
 
+        priority = None
+        if self.cfg.guided_ci:
+            # self-guided CI test ordering: severity on the preprocessed frames
+            # (method follows cfg.severity_method => guided alone uses zmax,
+            # tail+guided uses empirical-tail) — no truth/LLM input.
+            ranks = severity_scores(
+                normal_df, anomal_df, self.cfg.scaler, method=self.cfg.severity_method
+            )
+            priority = [col for col, _ in ranks] or None
+
         return psi_pc.run_multi_phase(
             normal_df,
             anomal_df,
             gamma=gamma,
             localized=localized,
             bins=bins,
-            seed=self.seed,
+            seed=self.seed if seed is None else seed,
             discretize_strategy=discretize_strategy,
+            priority=priority,
         )
+
+    def _rcd_consensus(
+        self,
+        data: dict[str, pd.DataFrame],
+        inject_ns: int,
+        *,
+        aa: list[tuple[str, float]],
+        resample_s: int = 15,
+        windows: int = 3,
+        gamma: int = 5,
+        localized: bool = True,
+        bins: int = 5,
+        discretize_strategy: str = "kmeans",
+    ) -> tuple[list[str], dict[str, float]]:
+        """Temporal block consensus over ``windows`` ordered views of the
+        cluster's metric/logts tables (no shuffle, no label use).
+
+        V0 = full normal/post; V1 = first ceil(0.75*n) rows of each side;
+        V2 = last ceil(0.75*n) rows of each side. A view is skipped when the
+        metric side has fewer than 4 rows. Each valid view runs the existing
+        ``_rcd_multimodal`` with ``seed = self.seed + view_index``; a service
+        at rank r in a view's order adds ``1/r`` to its consensus score.
+        Ordering: score desc, ties by V0 rank then original ``aa`` severity
+        order; members never returned by any view are appended per ``aa`` so
+        every cluster member is covered. All views failing falls back to
+        ``aa`` (caller records the failure). Returns (service order,
+        support={service: views_containing/valid_views}).
+        """
+        inject_s = inject_ns // 1_000_000_000
+        metric = data["metric"]
+        logts = data["logts"]
+        m_pre = metric[metric["time"] < inject_s]
+        m_post = metric[metric["time"] >= inject_s]
+        l_pre = logts[logts["time"] < inject_s]
+        l_post = logts[logts["time"] >= inject_s]
+        kp, kq = math.ceil(0.75 * len(m_pre)), math.ceil(0.75 * len(m_post))
+        lp, lq = math.ceil(0.75 * len(l_pre)), math.ceil(0.75 * len(l_post))
+        views: list[tuple[int, dict[str, pd.DataFrame]]] = []
+        for vi, (p, q, pl, ql) in enumerate(
+            [
+                (m_pre, m_post, l_pre, l_post),
+                (m_pre.head(kp), m_post.head(kq), l_pre.head(lp), l_post.head(lq)),
+                (m_pre.tail(kp), m_post.tail(kq), l_pre.tail(lp), l_post.tail(lq)),
+            ]
+        ):
+            if len(p) < 4 or len(q) < 4:
+                continue
+            views.append(
+                (
+                    vi,
+                    {
+                        "metric": pd.concat([p, q], ignore_index=True),
+                        "logts": pd.concat([pl, ql], ignore_index=True),
+                    },
+                )
+            )
+        aa_names = [s for s, _ in aa]
+        if not views:
+            return list(aa_names), {}
+        valid = len(views)
+        scores: dict[str, float] = {}
+        support_count: dict[str, int] = {}
+        v0_rank: dict[str, int] = {}
+        for vi, vdata in views:
+            ranks = self._rcd_multimodal(
+                vdata,
+                inject_ns,
+                dataset=None,
+                gamma=gamma,
+                localized=localized,
+                bins=bins,
+                discretize_strategy=discretize_strategy,
+                resample_s=resample_s,
+                seed=self.seed + vi,
+            )
+            order: list[str] = []
+            for col in ranks:
+                svc = col.split("_")[0]
+                if svc not in order:
+                    order.append(svc)
+            for r, svc in enumerate(order, start=1):
+                scores[svc] = scores.get(svc, 0.0) + 1.0 / r
+                support_count[svc] = support_count.get(svc, 0) + 1
+            if vi == 0:
+                v0_rank = {svc: i + 1 for i, svc in enumerate(order)}
+        aa_idx = {svc: i for i, svc in enumerate(aa_names)}
+        ordered = sorted(
+            aa_names,
+            key=lambda svc: (
+                -scores.get(svc, 0.0),
+                v0_rank.get(svc, len(aa_names) + 1),
+                aa_idx[svc],
+            ),
+        )
+        support = {svc: support_count.get(svc, 0) / valid for svc in aa_names}
+        return ordered, support
 
     # -- public analyze API ----------------------------------------------
 

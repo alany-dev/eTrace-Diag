@@ -53,8 +53,12 @@ DEFAULT_CONFIG = {
         "n_components_max": None,
         "discretize_strategy": "kmeans",
         "random_state": 0,
-        "gmm_max_iter": 50,
         "normal_post_trim": 0,
+        "severity_method": "zmax",
+        "guided_ci": False,
+        "temporal_precedence": False,
+        "rcd_consensus": False,
+        "rcd_consensus_windows": 3,
         "variant": "faithful",
     },
 }
