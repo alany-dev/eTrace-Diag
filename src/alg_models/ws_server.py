@@ -354,7 +354,7 @@ def evidence_to_inputs(body: dict) -> tuple[TelemetryFrame, tuple[LogEvent, ...]
         )
 
     traces: list[TraceSpan] = []
-    for kind, status in (("runq", "OK"), ("lock", "ERR")):
+    for kind, status in (("runq", "OK"), ("lock", "ERR"), ("iofile", "OK")):
         for ev in body.get("events", {}).get(kind, []) or []:
             if not isinstance(ev, dict):
                 continue
@@ -366,10 +366,21 @@ def evidence_to_inputs(body: dict) -> tuple[TelemetryFrame, tuple[LogEvent, ...]
                     trace_id=f"deep-{kind}-{start}",
                     span_id=str(ev.get("span_id", start)),
                     service_name=str(ev.get("entity", "host")),
-                    span_kind="internal", status=status,
+                    span_kind="internal",
+                    status="ERR" if ev.get("errors", 0) else status,
                     attrs={"evidence": f"{kind}_wait"},
                 )
             )
+    for ev in body.get("events", {}).get("iofile", []) or []:
+        if not isinstance(ev, dict):
+            continue
+        logs.append(
+            LogEvent(
+                ts_ns=int(ev.get("ts_ns", 0)), entity_id=str(ev.get("entity", "host")),
+                template_id=f"io_{str(ev.get('path', 'file')).split('/')[-1]}",
+                attrs={"evidence": "iofile_hotspot"},
+            )
+        )
 
     start = int(body.get("anomaly_start_ts", 0) or 0)
     end = int(body.get("anomaly_end_ts", 0) or 0)

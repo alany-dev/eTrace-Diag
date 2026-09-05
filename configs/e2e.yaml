@@ -1,0 +1,32 @@
+# e2e 联调配置：缩短预热与打分节奏，适配 90s 缩减版注入的时间线。
+# 与 smoke.yaml 同构；torai 段与 smoke 保持一致（fast 变体）。
+
+seed: 7
+
+split:
+  train_frac: 0.6
+  val_frac: 0.2
+  test_frac: 0.2
+
+detector:
+  name: edge_cascade
+  window_ns: 60000000000
+  stride_ns: 30000000000
+  low_freq: 3
+  n_fft: 16
+
+torai:
+  resample_s: 15
+  gamma: 5
+  bins: 5
+  localized: true
+  random_state: 0
+  gmm_max_iter: 50
+  variant: fast            # faithful|fast (identical numerics)
+
+ws:
+  warmup_seconds: 60       # e2e: 60s 正常基线后开始打分
+  stride_seconds: 20       # e2e: 90s 注入期内至少 3 个打分窗
+  window_seconds: 60
+  fuse_w: 0.3
+  threshold: 0.5
