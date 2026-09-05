@@ -4,6 +4,8 @@
 
 #include <cstdio>
 #include <ctime>
+#include <map>
+#include <string>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -1299,6 +1301,223 @@ void OutputWriter::WriteSummary(const std::string& content) {
   sqlite3_bind_text(st, 1, content.c_str(), -1, SQLITE_TRANSIENT);
   sqlite3_bind_int(st, 2, ordinal_);
   Step(S_EPISODE_SUMMARY, "deep_episodes.summary_text");
+}
+
+nlohmann::json OutputWriter::BuildEvidence(int ordinal) {
+  nlohmann::json ev;
+  ev["series"] = nlohmann::json::array();
+  ev["events"] = nlohmann::json::object();
+  if (!db_) return ev;
+
+  auto prep = [&](const char* sql, int arg) -> sqlite3_stmt* {
+    sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) {
+      LogWarn("evidence prep failed: %s", sqlite3_errmsg(db_));
+      return nullptr;
+    }
+    sqlite3_bind_int(st, 1, arg);
+    return st;
+  };
+
+  // ---- deep_series: per-(tick,tgid) process series + per-tid thread series.
+  // Process entities carry resource counters; thread entities carry the
+  // latency/contention metrics where thread identity matters (lock/runq/
+  // futex/syscall). tgid==0 rows degrade to per-tid entities only.
+  struct TAcc { uint64_t cpu = 0, io_ops = 0, io_bytes = 0, pf_min = 0, pf_maj = 0,
+                 lock_w = 0, lock_lat = 0, futex_w = 0, futex_lat = 0,
+                 sys_c = 0, sys_lat = 0, runq_c = 0, runq_lat = 0; };
+  std::map<uint64_t, std::map<uint32_t, TAcc>> per_ts_proc;  // ts -> tgid -> acc
+  {
+    sqlite3_stmt* st = prep(
+        "SELECT ts_ns, tid, tgid, on_cpu_ns, io_ops, io_bytes, pf_minor, pf_major,"
+        " lock_waits, lock_lat_ns, futex_waits, futex_lat_ns, syscall_count,"
+        " syscall_lat_ns, runq_wait_count, runq_wait_ns FROM deep_series"
+        " WHERE ordinal = ? ORDER BY ts_ns, tid",
+        ordinal);
+    if (st) {
+      while (sqlite3_step(st) == SQLITE_ROW) {
+        uint64_t ts = (uint64_t)sqlite3_column_int64(st, 0);
+        uint32_t tid = (uint32_t)sqlite3_column_int64(st, 1);
+        uint32_t tgid = (uint32_t)sqlite3_column_int64(st, 2);
+        if (tgid != 0) {
+          TAcc& a = per_ts_proc[ts][tgid];
+          a.cpu += (uint64_t)sqlite3_column_int64(st, 3);
+          a.io_ops += (uint64_t)sqlite3_column_int64(st, 4);
+          a.io_bytes += (uint64_t)sqlite3_column_int64(st, 5);
+          a.pf_min += (uint64_t)sqlite3_column_int64(st, 6);
+          a.pf_maj += (uint64_t)sqlite3_column_int64(st, 7);
+          a.lock_w += (uint64_t)sqlite3_column_int64(st, 8);
+          a.lock_lat += (uint64_t)sqlite3_column_int64(st, 9);
+          a.futex_w += (uint64_t)sqlite3_column_int64(st, 10);
+          a.futex_lat += (uint64_t)sqlite3_column_int64(st, 11);
+          a.sys_c += (uint64_t)sqlite3_column_int64(st, 12);
+          a.sys_lat += (uint64_t)sqlite3_column_int64(st, 13);
+          a.runq_c += (uint64_t)sqlite3_column_int64(st, 14);
+          a.runq_lat += (uint64_t)sqlite3_column_int64(st, 15);
+        }
+        // per-thread contention/latency series
+        auto trow = [&](const char* metric, uint64_t v) {
+          ev["series"].push_back({{"entity", "t" + std::to_string(tid)},
+                                  {"metric", metric}, {"ts_ns", ts}, {"value", v}});
+        };
+        trow("on_cpu_ns", (uint64_t)sqlite3_column_int64(st, 3));
+        trow("lock_waits", (uint64_t)sqlite3_column_int64(st, 8));
+        trow("lock_lat_ns", (uint64_t)sqlite3_column_int64(st, 9));
+        trow("futex_waits", (uint64_t)sqlite3_column_int64(st, 10));
+        trow("futex_lat_ns", (uint64_t)sqlite3_column_int64(st, 11));
+        trow("syscall_count", (uint64_t)sqlite3_column_int64(st, 12));
+        trow("syscall_lat_ns", (uint64_t)sqlite3_column_int64(st, 13));
+        trow("runq_wait_count", (uint64_t)sqlite3_column_int64(st, 14));
+        trow("runq_wait_ns", (uint64_t)sqlite3_column_int64(st, 15));
+      }
+      sqlite3_finalize(st);
+    }
+    for (const auto& [ts, by_tgid] : per_ts_proc) {
+      for (const auto& [tgid, a] : by_tgid) {
+        auto prow = [&](const char* metric, uint64_t v) {
+          ev["series"].push_back({{"entity", "proc" + std::to_string(tgid)},
+                                  {"metric", metric}, {"ts_ns", ts}, {"value", v}});
+        };
+        prow("on_cpu_ns", a.cpu); prow("io_ops", a.io_ops); prow("io_bytes", a.io_bytes);
+        prow("pf_minor", a.pf_min); prow("pf_major", a.pf_maj);
+        prow("lock_waits", a.lock_w); prow("lock_lat_ns", a.lock_lat);
+        prow("futex_waits", a.futex_w); prow("futex_lat_ns", a.futex_lat);
+        prow("syscall_count", a.sys_c); prow("syscall_lat_ns", a.sys_lat);
+        prow("runq_wait_count", a.runq_c); prow("runq_wait_ns", a.runq_lat);
+      }
+    }
+  }
+
+  // ---- host-level memory pressure series
+  {
+    sqlite3_stmt* st = prep(
+        "SELECT ts_ns, kswapd_active, direct_reclaim, nr_reclaimed FROM memory_events",
+        ordinal);
+    (void)st;
+    if (st) {
+      sqlite3_reset(st);  // no ordinal binding for memory_events; re-prepare
+      sqlite3_finalize(st);
+    }
+  }
+  {
+    sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(db_,
+        "SELECT ts_ns, kswapd_active, direct_reclaim, nr_reclaimed FROM memory_events",
+        -1, &st, nullptr) == SQLITE_OK) {
+      while (sqlite3_step(st) == SQLITE_ROW) {
+        uint64_t ts = (uint64_t)sqlite3_column_int64(st, 0);
+        auto hrow = [&](const char* metric, int64_t v) {
+          ev["series"].push_back({{"entity", "host"}, {"metric", metric},
+                                  {"ts_ns", ts}, {"value", v}});
+        };
+        hrow("kswapd_active", sqlite3_column_int64(st, 1));
+        hrow("direct_reclaim", sqlite3_column_int64(st, 2));
+        hrow("nr_reclaimed", sqlite3_column_int64(st, 3));
+      }
+      sqlite3_finalize(st);
+    }
+  }
+
+  ev["events"]["oom"] = nlohmann::json::array();
+  ev["events"]["syscall"] = nlohmann::json::array();
+  ev["events"]["lock"] = nlohmann::json::array();
+  ev["events"]["runq"] = nlohmann::json::array();
+  ev["events"]["iofile"] = nlohmann::json::array();
+
+  {
+    sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(db_, "SELECT ts_ns, pid, comm FROM oom_events",
+                           -1, &st, nullptr) == SQLITE_OK) {
+      while (sqlite3_step(st) == SQLITE_ROW) {
+        ev["events"]["oom"].push_back(
+            {{"ts_ns", (uint64_t)sqlite3_column_int64(st, 0)},
+             {"entity", "host"}, {"kind", "kill"},
+             {"pid", (uint64_t)sqlite3_column_int64(st, 1)},
+             {"comm", (const char*)sqlite3_column_text(st, 2)}});
+      }
+      sqlite3_finalize(st);
+    }
+  }
+  {
+    sqlite3_stmt* st = prep(
+        "SELECT tid, name, count, avg_us, p99_us, error_count FROM deep_syscall"
+        " WHERE ordinal = ?", ordinal);
+    if (st) {
+      while (sqlite3_step(st) == SQLITE_ROW) {
+        uint32_t tid = (uint32_t)sqlite3_column_int64(st, 0);
+        ev["events"]["syscall"].push_back(
+            {{"entity", "t" + std::to_string(tid)},
+             {"name", (const char*)sqlite3_column_text(st, 1)},
+             {"count", (uint64_t)sqlite3_column_int64(st, 2)},
+             {"avg_us", sqlite3_column_double(st, 3)},
+             {"p99_us", sqlite3_column_double(st, 4)},
+             {"error_count", (uint64_t)sqlite3_column_int64(st, 5)}});
+      }
+      sqlite3_finalize(st);
+    }
+  }
+  {
+    sqlite3_stmt* st = prep(
+        "SELECT addr, sym, count, total_wait_ns, avg_wait_ns FROM deep_lock"
+        " WHERE ordinal = ?", ordinal);
+    if (st) {
+      while (sqlite3_step(st) == SQLITE_ROW) {
+        ev["events"]["lock"].push_back(
+            {{"entity", "host"},
+             {"addr", (uint64_t)sqlite3_column_int64(st, 0)},
+             {"sym", (const char*)sqlite3_column_text(st, 1)},
+             {"count", (uint64_t)sqlite3_column_int64(st, 2)},
+             {"total_wait_ns", (uint64_t)sqlite3_column_int64(st, 3)},
+             {"avg_wait_ns", (uint64_t)sqlite3_column_int64(st, 4)}});
+      }
+      sqlite3_finalize(st);
+    }
+  }
+  {
+    sqlite3_stmt* st = prep(
+        "SELECT tid, count, avg_us, p50_us, p99_us FROM deep_runq WHERE ordinal = ?",
+        ordinal);
+    if (st) {
+      while (sqlite3_step(st) == SQLITE_ROW) {
+        uint32_t tid = (uint32_t)sqlite3_column_int64(st, 0);
+        double p99 = sqlite3_column_double(st, 4);
+        ev["events"]["runq"].push_back(
+            {{"entity", "t" + std::to_string(tid)},
+             {"count", (uint64_t)sqlite3_column_int64(st, 1)},
+             {"avg_us", sqlite3_column_double(st, 2)},
+             {"p50_us", sqlite3_column_double(st, 3)},
+             {"p99_us", p99},
+             {"wait_ns", (uint64_t)(p99 * 1000.0)}});
+      }
+      sqlite3_finalize(st);
+    }
+  }
+  {
+    sqlite3_stmt* st = prep(
+        "SELECT dev, ino, path, bytes, ops, errors, lat_sum, p50_us, p99_us"
+        " FROM deep_iofile WHERE ordinal = ?", ordinal);
+    if (st) {
+      while (sqlite3_step(st) == SQLITE_ROW) {
+        uint32_t dev = (uint32_t)sqlite3_column_int64(st, 0);
+        uint32_t major = dev >> 20;
+        uint32_t minor = dev & 0xFFFFF;
+        double p99 = sqlite3_column_double(st, 9);
+        ev["events"]["iofile"].push_back(
+            {{"entity", "dev" + std::to_string(major) + "m" + std::to_string(minor)},
+             {"ino", (uint64_t)sqlite3_column_int64(st, 1)},
+             {"path", (const char*)sqlite3_column_text(st, 2)},
+             {"bytes", (uint64_t)sqlite3_column_int64(st, 3)},
+             {"ops", (uint64_t)sqlite3_column_int64(st, 4)},
+             {"errors", (uint64_t)sqlite3_column_int64(st, 5)},
+             {"lat_sum", (uint64_t)sqlite3_column_int64(st, 6)},
+             {"p50_us", sqlite3_column_double(st, 7)},
+             {"p99_us", p99},
+             {"wait_ns", (uint64_t)(p99 * 1000.0)}});
+      }
+      sqlite3_finalize(st);
+    }
+  }
+  return ev;
 }
 
 void OutputWriter::WriteFoldedLine(const std::string& kind, const std::string& frames,

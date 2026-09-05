@@ -1,5 +1,9 @@
 #include "phase_manager.h"
 
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+
 #include "logging.h"
 
 namespace etrace_diag {
@@ -39,17 +43,36 @@ void PhaseManager::FinalizeDeep(const Config& cfg, uint64_t now_ns) {
 
   deep_.Finalize(cfg, summary);
 
-  // Causal inference: body carries the evidence bundle; result is opaque here.
+  // Causal inference: body carries the full evidence bundle (ADR-0004); the
+  // model replies with a structured diagnosis persisted as diagnosis.json.
+  nlohmann::json evidence = writer_.BuildEvidence(deep_ordinal_);
+  evidence["anomaly_start_ts"] = anomaly_start_ts_;
+  evidence["anomaly_end_ts"] = anomaly_end_ts_;
+  evidence["deep_ordinal"] = deep_ordinal_;
+  evidence["deep_indicators"] = indicators_;
+  evidence["post_deadline_ts"] = post_deadline_ns_;
+
   CausalContext ctx;
   ctx.seq = deep_ordinal_;
   ctx.window_start_ns = anomaly_start_ts_ > cfg.window.pre_anomaly_seconds * 1000000000ULL
                             ? anomaly_start_ts_ - cfg.window.pre_anomaly_seconds * 1000000000ULL
                             : 0;
   ctx.window_end_ns = now_ns;
-  ctx.body = summary;
+  ctx.body = evidence;
   try {
     CausalResult r = model_->InferCausal(ctx);
     summary["causal"] = {{"ok", r.ok}, {"raw", r.raw}};
+    if (r.ok && !r.raw.empty()) {
+      std::string path = writer_.session_dir() + "/diagnosis.json";
+      FILE* f = fopen(path.c_str(), "w");
+      if (f) {
+        fwrite(r.raw.data(), 1, r.raw.size(), f);
+        fclose(f);
+        LogInfo("diagnosis written to %s", path.c_str());
+      } else {
+        LogWarn("cannot write diagnosis.json: %s", strerror(errno));
+      }
+    }
   } catch (const std::exception& e) {
     summary["causal"] = {{"ok", false}, {"error", e.what()}};
   }

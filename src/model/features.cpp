@@ -56,13 +56,14 @@ void to_json(json& j, const CausalContext& c) {
 }
 
 void from_json(const json& j, CausalResult& r) {
-  // The causal model's reply is opaque in this milestone; capture the raw text.
+  // Reply contract (ADR-0003): {v, seq, ok, report?}. Keep the raw text for
+  // the session summary; `ok` gates diagnosis.json persistence.
   if (j.is_string()) {
     r.raw = j.get<std::string>();
     r.ok = true;
   } else {
     r.raw = j.dump();
-    r.ok = true;
+    r.ok = !j.contains("ok") || j["ok"].get<bool>();
   }
 }
 

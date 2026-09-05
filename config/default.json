@@ -40,11 +40,11 @@
   },
   "model": {
     "anomaly": {
-      "url": "ws://127.0.0.1:9001/anomaly",
+      "url": "ws://127.0.0.1:9000/anomaly",
       "timeout_ms": 5000
     },
     "causal": {
-      "url": "ws://127.0.0.1:9002/causal",
+      "url": "ws://127.0.0.1:9000/causal",
       "timeout_ms": 30000
     },
     "adapter": "ws"

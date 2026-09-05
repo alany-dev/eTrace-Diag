@@ -308,37 +308,37 @@ static __always_inline u64 *h_u64(void *map, const void *k) {
   return bpf_map_lookup_elem(map, k);
 }
 static __always_inline struct switch_t *h_sw(void *map, const void *k) {
-  struct switch_t z = {};
+  struct switch_t z;
   bpf_map_update_elem(map, k, &z, BPF_NOEXIST);
   return bpf_map_lookup_elem(map, k);
 }
 static __always_inline struct blk_io_t *h_blk(void *map, const void *k) {
-  struct blk_io_t z = {};
+  struct blk_io_t z;
   bpf_map_update_elem(map, k, &z, BPF_NOEXIST);
   return bpf_map_lookup_elem(map, k);
 }
 static __always_inline struct faults_t *h_flt(void *map, const void *k) {
-  struct faults_t z = {};
+  struct faults_t z;
   bpf_map_update_elem(map, k, &z, BPF_NOEXIST);
   return bpf_map_lookup_elem(map, k);
 }
 static __always_inline struct lat_stat *h_lat(void *map, const void *k) {
-  struct lat_stat z = {};
+  struct lat_stat z;
   bpf_map_update_elem(map, k, &z, BPF_NOEXIST);
   return bpf_map_lookup_elem(map, k);
 }
 static __always_inline struct sys_lat_val *h_sys(void *map, const void *k) {
-  struct sys_lat_val z = {};
+  struct sys_lat_val z;
   bpf_map_update_elem(map, k, &z, BPF_NOEXIST);
   return bpf_map_lookup_elem(map, k);
 }
 static __always_inline struct lock_hot_val *h_lock(void *map, const void *k) {
-  struct lock_hot_val z = {};
+  struct lock_hot_val z;
   bpf_map_update_elem(map, k, &z, BPF_NOEXIST);
   return bpf_map_lookup_elem(map, k);
 }
 static __always_inline struct io_file_val *h_iof(void *map, const void *k) {
-  struct io_file_val z = {};
+  struct io_file_val z;
   bpf_map_update_elem(map, k, &z, BPF_NOEXIST);
   return bpf_map_lookup_elem(map, k);
 }
@@ -432,7 +432,7 @@ int BPF_PROG(on_switch, bool preempt, struct task_struct *prev, struct task_stru
         u32 rate = rc ? rc->offcpu_rate : 0;
         u64 elapsed = (last && now > *last) ? (now - *last) : 0;
         if (last && rate && (*last == 0 || elapsed * (u64)rate >= 1000000000ULL)) {
-          struct offcpu_stash_t st = {};
+          struct offcpu_stash_t st;
           st.out_ts = now;
           st.ksid = 0;
           st.stack_available = 0;
@@ -515,7 +515,7 @@ int BPF_KPROBE(offcpu_schedule) {
   u64 elapsed = (last && now > *last) ? (now - *last) : 0;
   if (!last || !rate || (*last == 0 || elapsed * (u64)rate >= 1000000000ULL)) {
     int ksid = bpf_get_stackid(ctx, &stackmap, BPF_F_FAST_STACK_CMP);
-    struct offcpu_stash_t st = {};
+    struct offcpu_stash_t st;
     st.out_ts = now;
     st.ksid = ksid >= 0 ? (u32)ksid : 0;
     st.stack_available = ksid >= 0 ? 1 : 0;
@@ -548,7 +548,7 @@ int BPF_PROG(on_process_exit, struct task_struct *p) {
 // ===========================================================================
 SEC("tp_btf/block_rq_insert")
 int BPF_PROG(on_rq_insert, struct request *rq) {
-  struct blk_req_t e = {};
+  struct blk_req_t e;
   e.insert_ts = bpf_ktime_get_ns();
   // gendisk.major/first_minor are stable across 5.15..6.6 and encode the
   // whole-disk devt (dev_t = major<<20 | first_minor). gendisk.devt does not
@@ -662,7 +662,7 @@ int BPF_PROG(on_mark_victim, int pid) {
   if (!seqp) return 0;
   u32 seq = *seqp; *seqp = seq + 1;  // best-effort ring append (rare event)
   u32 ix = seq & (OOM_EVENTS_CAP - 1);
-  struct oom_event_t ev = {};
+  struct oom_event_t ev;
   ev.ts = bpf_ktime_get_ns();
   ev.pid = (u32)pid;
   bpf_map_update_elem(&oom_events, &ix, &ev, BPF_ANY);
@@ -679,7 +679,7 @@ int BPF_PROG(on_mark_victim, int pid) {
 SEC("tp_btf/contention_begin")
 int BPF_PROG(on_contention_begin, void *lock, u32 flags) {
   u32 tid = (u32)bpf_get_current_pid_tgid();
-  struct lock_wait_t w = {};
+  struct lock_wait_t w;
   w.lock_addr = (u64)lock;
   w.ts = bpf_ktime_get_ns();
   w.flags = flags;
@@ -711,7 +711,7 @@ SEC("kprobe/__mutex_lock_slowpath")
 int BPF_KPROBE(mutex_lock_slow, atomic_long_t *lock_count, unsigned int subclass) {
   (void)subclass;
   u32 tid = (u32)bpf_get_current_pid_tgid();
-  struct lock_wait_t w = {};
+  struct lock_wait_t w;
   w.lock_addr = (u64)lock_count;
   w.ts = bpf_ktime_get_ns();
   w.flags = 0;
@@ -751,7 +751,7 @@ int task_iter(struct bpf_iter__task *ctx) {
 
   u32 pid = BPF_CORE_READ(task, pid);
   u32 tgid = BPF_CORE_READ(task, tgid);
-  char comm[16] = {};
+  char comm[16];
   bpf_probe_read_kernel_str(comm, sizeof(comm), BPF_CORE_READ(task, comm));
   unsigned int state = BPF_CORE_READ(task, __state);
   u64 start_time = BPF_CORE_READ(task, start_time);
@@ -783,16 +783,11 @@ int task_iter(struct bpf_iter__task *ctx) {
   struct mm_struct *mm = BPF_CORE_READ(task, mm);
   if (mm) {
     total_vm = BPF_CORE_READ(mm, total_vm);
-    if (bpf_core_field_exists(mm->rss_stat)) {
-      // rss_stat.count[] is atomic64_t on 5.15: copy the raw long value.
-      bpf_core_read(&rss_file, 8, &mm->rss_stat.count[MM_FILEPAGES]);
-      bpf_core_read(&rss_anon, 8, &mm->rss_stat.count[MM_ANONPAGES]);
-      bpf_core_read(&rss_shmem, 8, &mm->rss_stat.count[MM_SHMEMPAGES]);
-      // MM_SWAPENTS exists on every supported kernel (>=5.9); index 2 in
-      // both 5.15 and 6.6 BTF.
-      if (NR_MM_COUNTERS > 2)
-        bpf_core_read(&swap_ents, 8, &mm->rss_stat.count[2]);
-    }
+    // rss_stat.count[] is atomic64_t on 5.15 but struct percpu_counter[4] on
+    // 6.6+ (BPF-unreadable; the C-level array subscript also breaks CO-RE
+    // preserve_access_index on 6.6+ vmlinux.h). RSS for targets is completed
+    // host-side from /proc (ProcessRow.rss_kb / rss_valid; deep_proc falls
+    // back to /proc/<tid>/status), per README known limitations.
   }
 
   // bpf_seq_printf caps at 12 varargs -> three prefixed lines per task.
@@ -862,7 +857,7 @@ int BPF_PROG(fentry_sys, struct pt_regs *regs, unsigned int nr) {
     u64 cmd = arg1 & FUTEX_CMD_MASK;
     if (cmd == FUTEX_WAIT || cmd == FUTEX_WAIT_BITSET) futex_wait = 1;
   }
-  struct sys_start_t st = {};
+  struct sys_start_t st;
   st.id = (u32)id;
   st.ts = bpf_ktime_get_ns();
   st.futex_wait = futex_wait;
@@ -904,7 +899,7 @@ int BPF_PROG(on_sys_enter, struct pt_regs *regs, long id) {
     if (cmd == FUTEX_WAIT || cmd == FUTEX_WAIT_BITSET) futex_wait = 1;
   }
 
-  struct sys_start_t s = {};
+  struct sys_start_t s;
   s.id = (u32)id;
   s.ts = bpf_ktime_get_ns();
   s.futex_wait = futex_wait;
@@ -965,7 +960,7 @@ static __always_inline void iofile_enter(struct file *f) {
   if (!tid_is_target(tid)) return;
   if (!iofile_sampled()) return;
 
-  struct io_start_t st = {};
+  struct io_start_t st;
   st.dev = (u32)BPF_CORE_READ(f, f_inode, i_sb, s_dev);
   st.ino = BPF_CORE_READ(f, f_inode, i_ino);
   st.ts = bpf_ktime_get_ns();
@@ -985,7 +980,7 @@ static __always_inline void iofile_exit(long ret) {
   u64 now = bpf_ktime_get_ns();
   u64 lat = now > st->ts ? now - st->ts : 0;
 
-  struct io_file_key k = {};
+  struct io_file_key k;
   k.dev = st->dev;
   k.ino = st->ino;
   bpf_probe_read_kernel_str(k.path, sizeof(k.path), st->path);
@@ -1041,7 +1036,7 @@ static __always_inline void iofile_enter_kprobe(struct file *f) {
   u32 tid = (u32)bpf_get_current_pid_tgid();
   if (!tid_is_target(tid)) return;
   if (!iofile_sampled()) return;
-  struct io_start_t st = {};
+  struct io_start_t st;
   st.dev = (u32)BPF_CORE_READ(f, f_inode, i_sb, s_dev);
   st.ino = BPF_CORE_READ(f, f_inode, i_ino);
   st.ts = bpf_ktime_get_ns();
@@ -1126,7 +1121,7 @@ static __always_inline void tcp_connect_enter(struct sock *sk) {
   if (!tid_is_target(tid)) return;
   u64 cookie = sock_cookie(sk);
   if (!cookie) return;
-  struct sock_owner_t o = {};
+  struct sock_owner_t o;
   o.tgid = (u64)(bpf_get_current_pid_tgid() >> 32);
   o.tid = tid;
   fill_tuple(&o, sk);
@@ -1210,7 +1205,7 @@ int BPF_KRETPROBE(kretprobe_inet_csk_accept, int ret) {
   if (!sk) return 0;
   u64 cookie = sock_cookie(sk);
   if (!cookie) return 0;
-  struct sock_owner_t o = {};
+  struct sock_owner_t o;
   o.tgid = (u64)(bpf_get_current_pid_tgid() >> 32);
   o.tid = tid;
   fill_tuple(&o, sk);
@@ -1239,7 +1234,7 @@ int BPF_PROG(net_sock_state, const struct sock *sk, int oldstate, int newstate) 
       bpf_map_delete_elem(&sock_owner, &cookie);
     } else {
       // unowned close: record an unowned aggregate flow.
-      struct sock_owner_t f = {};
+      struct sock_owner_t f;
       f.netns_ino = BPF_CORE_READ(sk, __sk_common.skc_net.net, ns.inum);
       f.family = sock_family((struct sock *)sk);
       flow_bytes((struct sock *)sk, &f.tx_bytes, &f.rx_bytes);
@@ -1297,7 +1292,7 @@ int BPF_PROG(net_kfree_skb, struct sk_buff *skb, void *location, unsigned short 
   rl->last_ts[1] = now;
 
   struct net_device *dev = BPF_CORE_READ(skb, dev);
-  struct net_drop_key k = {};
+  struct net_drop_key k;
   k.ifindex = dev ? BPF_CORE_READ(dev, ifindex) : 0;
   // netns of the skb is unreliable without the sock; use dev netns when present.
   if (dev) k.netns_ino = BPF_CORE_READ(dev, nd_net.net, ns.inum);

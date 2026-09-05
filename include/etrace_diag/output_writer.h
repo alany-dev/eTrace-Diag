@@ -49,6 +49,11 @@ class OutputWriter {
   void WritePostSeriesGap(uint64_t from_head, uint64_t to_head);  // deep_gap @ last_deep_ts_
   void WriteMeta(const nlohmann::json& meta_json);       // UPDATE deep_episodes SET meta_json
   void WriteSummary(const std::string& content);         // UPDATE deep_episodes SET summary_text
+  // Builds the WS causal evidence bundle (ADR-0004) for a finished DEEP
+  // episode `ordinal`: per-tick series (proc<tgid> / t<tid> / host entities,
+  // underscore-free to satisfy TORAI's fine->coarse prefix convention) plus
+  // oom / syscall / lock / runq / iofile event tables.
+  nlohmann::json BuildEvidence(int ordinal);
   void WriteFoldedLine(const std::string& kind, const std::string& frames, uint64_t value);
   // id 为系统调用号，name 为对应系统调用名（read/write/open/...，writer 内查表）。
   void WriteDeepSyscall(uint32_t tid, uint32_t id, uint64_t count, float avg_us,
