@@ -108,69 +108,9 @@ class TestToraiNoLeakage:
         )
         normal = df[df["time"] < 60][["x_cpu", "y_cpu"]]
         anomal = df[df["time"] >= 60][["x_cpu", "y_cpu"]]
-        ranks = severity_scores(normal, anomal, "standard")
+        ranks = severity_scores(normal, anomal, variant="fast")
         d = dict(ranks)
         mu, sd = pre.mean(), pre.std(ddof=0)
         z_x = np.max(np.abs((post + 30.0 - mu) / sd))
         z_y = np.max(np.abs((post - mu) / sd))
         assert np.isclose(d["x_cpu"], z_x / (z_x + z_y), rtol=1e-3)
-
-class TestModuleNoLeakage:
-    def test_empirical_tail_fit_only_from_normal(self):
-        """Two inputs with identical normal, different post: the tail
-        reference (median(normal), d=abs(normal-center)) is unchanged and
-        only d* (max|anomal-center|) moves with the post values."""
-        normal2 = pd.DataFrame({"x_cpu": [0.0, 1.0, 2.0, 3.0, 4.0],
-                                "y_cpu": [0.0, 1.0, 2.0, 3.0, 4.0]})
-        pa = pd.DataFrame({"x_cpu": [3.0] * 3, "y_cpu": [3.0] * 3})
-        pb = pd.DataFrame({"x_cpu": [100.0] * 3, "y_cpu": [3.0] * 3})
-        sa = severity_scores(normal2, pa, "standard", method="empirical_tail")
-        sb = severity_scores(normal2, pb, "standard", method="empirical_tail")
-        da, db = dict(sa), dict(sb)
-        # y unchanged (post identical): its normalized share shrinks only
-        # because x's raw score grew; the y raw score is post-independent
-        assert da["y_cpu"] > db["y_cpu"]
-        # manual recomputation proves the reference uses normal-only stats:
-        # center=median(normal)=2, d=[2,1,0,1,2]
-        p_y = (1 + 4) / 6.0  # y post 3 -> d*=1, count(d>=1)=4 (2,1,1,2)
-        raw_y = -np.log(p_y)
-        p_xa = (1 + 4) / 6.0  # x post 3 -> d*=1, same as y
-        p_xb = (1 + 0) / 6.0  # x post 100 -> d*=98, count(d>=98)=0
-        assert da["y_cpu"] == pytest.approx(raw_y / (raw_y + -np.log(p_xa)), rel=1e-9)
-        assert db["y_cpu"] == pytest.approx(raw_y / (raw_y + -np.log(p_xb)), rel=1e-9)
-
-    def test_onset_fit_only_from_pre_inject(self):
-        """Same pre-inject window, different post: mean/std fit (pre only)
-        identical; post values only move the detected onset index."""
-        from alg_models.causal.torai import temporal_precedence_scores
-
-        n = 40
-        t = np.arange(n) * 15
-        pre = 50.0 + 0.1 * np.sin(2 * np.pi * np.arange(n) / 60)
-        a = pd.DataFrame({"time": t, "root_cpu": pre.copy(), "child_cpu": pre.copy()})
-        b = pd.DataFrame({"time": t, "root_cpu": pre.copy(), "child_cpu": pre.copy()})
-        post = t >= 300
-        a.loc[post & (t >= 330), "root_cpu"] += 20  # onset idx 2
-        a.loc[post & (t >= 360), "child_cpu"] += 20
-        b.loc[post & (t >= 360), "root_cpu"] += 20  # onset idx 4 (later)
-        b.loc[post & (t >= 330), "child_cpu"] += 20
-        pa = temporal_precedence_scores(a, 300, ["root", "child"])
-        pb = temporal_precedence_scores(b, 300, ["root", "child"])
-        # pre-inject fit identical -> the onset flip comes solely from post
-        assert pa == {"root": 1.0, "child": 0.0}
-        assert pb == {"root": 0.0, "child": 1.0}
-
-    def test_module_parser_rejects_truth_and_metadata(self):
-        from experiments.torai_ablation_matrix import parse_modules
-
-        for bad in ("truth", "fault", "system", "object", "tail,fault",
-                    "tail,system", "tail,object", "tail,truth"):
-            with pytest.raises(ValueError):
-                parse_modules(bad)
-        # valid canonical modules still parse
-        assert parse_modules("tail,guided,onset,consensus") == {
-            "severity_method": "empirical_tail",
-            "guided_ci": True,
-            "temporal_precedence": True,
-            "rcd_consensus": True,
-        }

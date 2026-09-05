@@ -28,19 +28,9 @@ torai:
   gamma: 5
   bins: 5
   localized: true
-  scaler: standard        # robust shown to collapse SS log-modality severity (user decision 2026-08-29)
-  covariance_type: diag   # full = faithful
-  n_components_max: 10
-  discretize_strategy: quantile
   random_state: 0
   gmm_max_iter: 50
-  normal_post_trim: 15
-  severity_method: zmax      # zmax | empirical_tail (tail)
-  guided_ci: false           # guided
-  temporal_precedence: false # onset
-  rcd_consensus: false       # consensus
-  rcd_consensus_windows: 3   # fixed
-  variant: improved          # faithful|improved
+  variant: fast            # faithful|fast (identical numerics; fast = vectorized severity)
 
 compute:
   profile: smoke              # smoke|quick|standard|full

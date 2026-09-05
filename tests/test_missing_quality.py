@@ -181,7 +181,7 @@ class TestToraiQuality:
         tables = to_torai_frames(frame, (), ())
         result = rca.analyze_tables(
             tables["metric"], tables["logts"], None, None,
-            inject_ns=300_000_000_000, variant="faithful",
+            inject_ns=300_000_000_000,
         )
         for svc, sev in result["severity_matrix"].items():
             assert sev["log"] == 0.0
@@ -206,7 +206,7 @@ class TestToraiQuality:
         )
         normal = df[df["time"] < 60][["x_cpu", "y_cpu"]]
         anomal = df[df["time"] >= 60][["x_cpu", "y_cpu"]]
-        ranks = severity_scores(normal, anomal, "standard")
+        ranks = severity_scores(normal, anomal, variant="fast")
         d = dict(ranks)
         mu, sd = pre.mean(), pre.std(ddof=0)
         z_x = np.max(np.abs((post + 30.0 - mu) / sd))
