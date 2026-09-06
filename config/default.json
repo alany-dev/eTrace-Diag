@@ -45,7 +45,7 @@
     },
     "causal": {
       "url": "ws://127.0.0.1:9000/causal",
-      "timeout_ms": 30000
+      "timeout_ms": 90000
     },
     "adapter": "ws"
   },

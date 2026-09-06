@@ -23,31 +23,43 @@ STRESS=90
 POST=40
 RUN_SECONDS=$((WARMUP + STRESS + POST + 10))
 COLLECTOR="$ROOT/build/etrace-diag"
-MODEL_PY="$ROOT/models/.venv/bin/python"
-MODEL_CFG="$ROOT/models/configs/e2e.yaml"
+MODEL_DIR="${MODEL_DIR:-$ROOT/models}"
+MODEL_PY="${MODEL_PY:-$MODEL_DIR/.venv/bin/python}"
+MODEL_CFG="$MODEL_DIR/configs/e2e.yaml"
 
 mkdir -p "$OUT"
 [ -x "$COLLECTOR" ] || { echo "collector not built: $COLLECTOR" >&2; exit 1; }
 [ -x "$MODEL_PY" ] || { echo "model env missing: $MODEL_PY (run setup_openkylin.sh)" >&2; exit 1; }
 
+WS_PID=""
+COL_PID=""
 cleanup() {
-  sudo -n kill -INT "$COL_PID" 2>/dev/null || true
-  kill "$WS_PID" 2>/dev/null || true
+  [ -n "$COL_PID" ] && sudo -n kill -INT "$COL_PID" 2>/dev/null || true
+  [ -n "$WS_PID" ] && kill "$WS_PID" 2>/dev/null || true
   wait "$COL_PID" 2>/dev/null || true
 }
 trap cleanup EXIT
 
 # 1. model WS server (warmup/stride per models/configs/e2e.yaml)
-(cd "$ROOT/models" && exec "$MODEL_PY" -m alg_models.ws_server \
+(cd "$MODEL_DIR" && exec "$MODEL_PY" -m alg_models.ws_server \
   --config configs/e2e.yaml --host 127.0.0.1 --port 9000) >"$OUT/ws_server.log" 2>&1 &
 WS_PID=$!
-sleep 6
-curl -s -m 5 -o /dev/null -w '' http://127.0.0.1:9000/docs || { echo "ws server not up" >&2; exit 1; }
+for _ in $(seq 1 30); do
+  sleep 2
+  if curl -s -m 3 -o /dev/null http://127.0.0.1:9000/docs; then break; fi
+  kill -0 "$WS_PID" 2>/dev/null || break
+done
+if ! curl -s -m 3 -o /dev/null http://127.0.0.1:9000/docs; then
+  echo "ws server not up; last log lines:" >&2
+  tail -5 "$OUT/ws_server.log" >&2
+  exit 1
+fi
 
-# 2. collector (BASE 全程；模型预热后打分，DEEP 由模型触发)
-ETRACE_DIAG_OUTPUT_DIR="$OUT" sudo -n "$COLLECTOR" \
-  --config "$ROOT/config/default.json" --run-seconds "$RUN_SECONDS" \
-  >"$OUT/collector.log" 2>&1 &
+# 2. collector (BASE 全程；模型预热后打分，DEEP 由模型触发；post 窗口压到
+#    30s 让 DEEP 在注入结束后自然 finalize 并完成因果推理)
+ETRACE_DIAG_WINDOW_POST_ANOMALY_SECONDS=30 \
+"$COLLECTOR" --config "$ROOT/config/default.json" --run-seconds "$RUN_SECONDS" \
+  --output-dir "$OUT" >"$OUT/collector.log" 2>&1 &
 COL_PID=$!
 
 # 3. warmup window (normal baseline), then inject
@@ -72,8 +84,20 @@ case "$SCEN" in
 esac
 wait "$STRESS_PID"
 
-# 4. post window + causal inference
+# 4. post window: DEEP finalizes at the 30s deadline and runs the causal
+#    analysis; poll for diagnosis.json before stopping anything.
 sleep "$POST"
+for _ in $(seq 1 24); do
+  S_NOW=$(ls -td "$OUT"/*/ 2>/dev/null | head -1)
+  [ -n "$S_NOW" ] && [ -f "$S_NOW/diagnosis.json" ] && break
+  sleep 5
+done
+# stop the collector (its shutdown finalizes any remaining DEEP state), then
+# the server. The causal request needs the server alive, so the collector
+# goes first.
+sudo -n kill -INT "$COL_PID" 2>/dev/null || true
+wait "$COL_PID" 2>/dev/null || true
+COL_PID=""
 cleanup
 trap - EXIT
 

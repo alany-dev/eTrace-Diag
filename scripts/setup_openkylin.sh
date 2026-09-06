@@ -38,7 +38,7 @@ dpkg --configure -a || true
 apt-get update -qq
 apt-get install -y \
   cmake gcc g++ make pkg-config \
-  libbpf-dev libelf-dev zlib1g-dev \
+  libbpf-dev libelf-dev zlib1g-dev libsqlite3-dev \
   python3-pip python3-venv \
   bpftool rsync git sqlite3
 

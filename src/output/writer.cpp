@@ -2,6 +2,7 @@
 
 #include <sqlite3.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <ctime>
 #include <map>
@@ -1322,11 +1323,20 @@ nlohmann::json OutputWriter::BuildEvidence(int ordinal) {
   // ---- deep_series: per-(tick,tgid) process series + per-tid thread series.
   // Process entities carry resource counters; thread entities carry the
   // latency/contention metrics where thread identity matters (lock/runq/
-  // futex/syscall). tgid==0 rows degrade to per-tid entities only.
+  // futex/syscall). Thread series are capped to the top-8 threads by
+  // contention activity to bound the causal model's column space (Psi-PC
+  // scales ~O(cols^2)). tgid==0 rows degrade to per-tid entities only.
   struct TAcc { uint64_t cpu = 0, io_ops = 0, io_bytes = 0, pf_min = 0, pf_maj = 0,
                  lock_w = 0, lock_lat = 0, futex_w = 0, futex_lat = 0,
                  sys_c = 0, sys_lat = 0, runq_c = 0, runq_lat = 0; };
   std::map<uint64_t, std::map<uint32_t, TAcc>> per_ts_proc;  // ts -> tgid -> acc
+  struct TSeries {
+    uint64_t ts;
+    uint64_t on_cpu = 0, lock_w = 0, lock_lat = 0, futex_w = 0, futex_lat = 0,
+             sys_c = 0, sys_lat = 0, runq_c = 0, runq_lat = 0;
+  };
+  std::map<uint32_t, std::vector<TSeries>> per_tid_series;
+  std::map<uint32_t, uint64_t> tid_activity;
   {
     sqlite3_stmt* st = prep(
         "SELECT ts_ns, tid, tgid, on_cpu_ns, io_ops, io_bytes, pf_minor, pf_major,"
@@ -1355,20 +1365,21 @@ nlohmann::json OutputWriter::BuildEvidence(int ordinal) {
           a.runq_c += (uint64_t)sqlite3_column_int64(st, 14);
           a.runq_lat += (uint64_t)sqlite3_column_int64(st, 15);
         }
-        // per-thread contention/latency series
-        auto trow = [&](const char* metric, uint64_t v) {
-          ev["series"].push_back({{"entity", "t" + std::to_string(tid)},
-                                  {"metric", metric}, {"ts_ns", ts}, {"value", v}});
-        };
-        trow("on_cpu_ns", (uint64_t)sqlite3_column_int64(st, 3));
-        trow("lock_waits", (uint64_t)sqlite3_column_int64(st, 8));
-        trow("lock_lat_ns", (uint64_t)sqlite3_column_int64(st, 9));
-        trow("futex_waits", (uint64_t)sqlite3_column_int64(st, 10));
-        trow("futex_lat_ns", (uint64_t)sqlite3_column_int64(st, 11));
-        trow("syscall_count", (uint64_t)sqlite3_column_int64(st, 12));
-        trow("syscall_lat_ns", (uint64_t)sqlite3_column_int64(st, 13));
-        trow("runq_wait_count", (uint64_t)sqlite3_column_int64(st, 14));
-        trow("runq_wait_ns", (uint64_t)sqlite3_column_int64(st, 15));
+        // per-thread contention/latency series: buffer, then emit only the
+        // top-8 threads by contention activity (bounded causal column space)
+        TSeries& tsr = per_tid_series[tid].emplace_back();
+        tsr.ts = ts;
+        tsr.on_cpu = (uint64_t)sqlite3_column_int64(st, 3);
+        tsr.lock_w = (uint64_t)sqlite3_column_int64(st, 8);
+        tsr.lock_lat = (uint64_t)sqlite3_column_int64(st, 9);
+        tsr.futex_w = (uint64_t)sqlite3_column_int64(st, 10);
+        tsr.futex_lat = (uint64_t)sqlite3_column_int64(st, 11);
+        tsr.sys_c = (uint64_t)sqlite3_column_int64(st, 12);
+        tsr.sys_lat = (uint64_t)sqlite3_column_int64(st, 13);
+        tsr.runq_c = (uint64_t)sqlite3_column_int64(st, 14);
+        tsr.runq_lat = (uint64_t)sqlite3_column_int64(st, 15);
+        tid_activity[tid] += tsr.lock_lat + tsr.futex_lat + tsr.runq_lat +
+                             tsr.lock_w + tsr.futex_w + tsr.runq_c;
       }
       sqlite3_finalize(st);
     }
@@ -1384,6 +1395,26 @@ nlohmann::json OutputWriter::BuildEvidence(int ordinal) {
         prow("futex_waits", a.futex_w); prow("futex_lat_ns", a.futex_lat);
         prow("syscall_count", a.sys_c); prow("syscall_lat_ns", a.sys_lat);
         prow("runq_wait_count", a.runq_c); prow("runq_wait_ns", a.runq_lat);
+      }
+    }
+    // emit thread series for the top-8 most contention-active tids
+    std::vector<std::pair<uint32_t, uint64_t>> ranked(tid_activity.begin(),
+                                                      tid_activity.end());
+    std::sort(ranked.begin(), ranked.end(),
+              [](const auto& a, const auto& b) { return a.second > b.second; });
+    if (ranked.size() > 8) ranked.resize(8);
+    for (const auto& [tid, _act] : ranked) {
+      const std::string ent = "t" + std::to_string(tid);
+      for (const TSeries& r : per_tid_series[tid]) {
+        auto trow = [&](const char* metric, uint64_t v) {
+          ev["series"].push_back({{"entity", ent}, {"metric", metric},
+                                  {"ts_ns", r.ts}, {"value", v}});
+        };
+        trow("on_cpu_ns", r.on_cpu);
+        trow("lock_waits", r.lock_w); trow("lock_lat_ns", r.lock_lat);
+        trow("futex_waits", r.futex_w); trow("futex_lat_ns", r.futex_lat);
+        trow("syscall_count", r.sys_c); trow("syscall_lat_ns", r.sys_lat);
+        trow("runq_wait_count", r.runq_c); trow("runq_wait_ns", r.runq_lat);
       }
     }
   }

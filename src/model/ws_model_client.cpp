@@ -56,17 +56,21 @@ class WsModelClient : public IModelClient {
                  uint64_t timeout_ms) {
     if (!ws.IsOpen()) {
       if (!ws.Connect(url, timeout_ms)) {
+        LogWarn("ws roundtrip: connect to %s failed", url.c_str());
         ws.Close();
         return false;
       }
     }
     nlohmann::json j;
     to_json(j, msg);
-    if (!ws.SendText(j.dump())) {
+    std::string payload = j.dump();
+    if (!ws.SendText(payload)) {
+      LogWarn("ws roundtrip: send failed (%llu bytes)", (unsigned long long)payload.size());
       ws.Close();
       return false;
     }
     if (!ws.RecvText(out, timeout_ms)) {
+      LogWarn("ws roundtrip: recv failed (timeout or close)");
       ws.Close();
       return false;
     }
