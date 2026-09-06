@@ -1,10 +1,10 @@
 # eTrace-Diag
 
-基于 eBPF 的系统异常观测与根因定位工具（社区赛题）。轻量级、低开销，面向 CPU 异常占用、I/O 延迟抖动、内存抖动/OOM 风险、锁竞争、高频/高耗时系统调用热点五类典型异常场景，实时观测、指标采集、事件关联，并将结构化证据交由异常检测 / 因果推断模型（WebSocket，预留 ONNX 端口）完成根因诊断。
+基于 eBPF 的系统异常观测与根因定位工具（社区赛题）。轻量级、低开销，面向 CPU 异常占用、I/O 延迟抖动、内存抖动/OOM 风险、锁竞争、高频/高耗时系统调用热点五类典型异常场景，实时观测、指标采集、事件关联，并通过 WebSocket 把结构化证据交由异常检测 / 因果推断模型完成根因诊断（协议见 `docs/adr/0003-ws-integration-contract.md`）。
 
 eBPF-based system anomaly observation and root-cause diagnosis tool. Low-overhead, CO-RE, targets CPU saturation, I/O latency jitter, memory pressure/OOM risk, lock contention, and syscall hotspots.
 
-> 当前为**数据采集**里程碑：产出结构化指标/事件/调用栈证据文件；诊断结论由外部模型给出（本仓库提供 WS 协议客户端与 mock 服务端）。
+> **当前状态**：采集器与算法模型已完成 WS 联调。采集器产出结构化指标/事件/调用栈证据，DEEP 证据包经 `ws://<host>:9000/causal` 交给 `models/` 下的 TORAI 因果模型，结构化诊断落盘为会话 `diagnosis.json`；异常检测（Time-RCD-Fuse）经 `/anomaly` 驱动 BASE→DEEP 状态机。模型侧说明见 [`models/README.md`](models/README.md)。
 > 详细设计见 [`docs/architecture.md`](docs/architecture.md)，实测开销见 [`docs/overhead-baseline-20260828.md`](docs/overhead-baseline-20260828.md)。
 
 ---
@@ -119,12 +119,27 @@ python3 tools/viz/serve.py --port 9000 --out /data/runs   # 自定义端口与�
 ./scripts/scenario_mem.sh
 ./scripts/scenario_lock.sh
 
-# 阶段切换测试（mock 模型，触发一次异常）
-python3 scripts/mock_model.py --trigger-once &
-sudo ./build/etrace-diag --output-dir ./out --config config/default.json
+# 采集器独立回归（mock 模型触发一次异常 → DEEP → 证据打包 → diagnosis.json）
+sudo MODEL_PY=<models venv python> ./scripts/regress_mock.sh 45
+
+# 真实模型 WS 端到端联调（每场景约 3.5 分钟：预热 60s + 注入 90s + post 40s）
+sudo bash scripts/e2e_scenario.sh cpu     # cpu|io|mem|lock，见 models/configs/e2e.yaml
 ```
 
-验证断言：BASE ≥1 行/s、DEEP 窗口时间戳 ∈ `[anomaly_start−pre, anomaly_start+post]`、热点文件非空、top-k 成员出现在 `targets.log`、自开销文件逐秒增长。
+端到端断言：DEEP episode ≥ 1、`diagnosis.json` 的 CausalReport 非空且候选实体
+为 `proc<pid>` / `dev<maj>m<n>` / `host` 之一、异常类型与注入场景一致。
+
+## 一键环境部署（openKylin）
+
+```bash
+sudo ./scripts/setup_openkylin.sh          # 工具链 + stress-ng/fio + 模型环境 + checkpoint
+```
+
+过程记录与排错见 [`docs/env-setup-openkylin.md`](docs/env-setup-openkylin.md)；
+QEMU 四架构（amd64/arm64/loongarch64/riscv64）验证计划见
+[`docs/qemu-crossarch-plan.md`](docs/qemu-crossarch-plan.md)。
+
+场景脚本验证断言：BASE ≥1 行/s、DEEP 窗口时间戳 ∈ `[anomaly_start−pre, anomaly_start+post]`、热点文件非空、top-k 成员出现在 `targets_log`、自开销文件逐秒增长。
 
 ## 实测开销（2026-08-28，5.15 共享机，仅 BPF 程序体）
 
@@ -150,11 +165,12 @@ cmake/              libbpf / bpftool 构建适配
 config/             默认配置
 include/etrace_diag/ 公共头（config/metrics/output_writer/model_client/app）
 src/                C++ 实现（collect/ model/ output/ 及主循环）
-scripts/            构建、运行、mock 模型、场景复现
+scripts/            构建、运行、mock 模型、场景复现、e2e 联调、openKylin 一键部署
+models/             算法模型（Time-RCD-Fuse 异常检测 + TORAI 因果 RCA + WS 服务）
 tools/viz/          浏览器端会话可视化（静态页面 + serve.py + node 测试）
 tests/              构建期测试（config_probe）
 third_party/        vendored 单头 nlohmann/json
-docs/               架构说明 + 开销基线
+docs/               架构/开销基线/ADR/术语表/部署记录/QEMU 多架构计划
 ```
 
 ## 许可
