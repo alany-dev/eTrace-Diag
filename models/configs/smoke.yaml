@@ -1,0 +1,56 @@
+# Smoke-test configuration — deterministic, tiny, CPU-only.
+# Calibration sources are recorded in every ModelCard (calibration_basis);
+# thresholds are derived ONLY from train/validation splits, never test labels.
+
+seed: 7
+
+split:
+  train_frac: 0.6
+  val_frac: 0.2
+  test_frac: 0.2
+
+detector:
+  name: edge_cascade
+  window_ns: 60000000000      # 60 s
+  stride_ns: 30000000000      # 30 s
+  low_freq: 3
+  n_fft: 16
+  event_pot_quantile: 0.99
+  event_pot_multiplier: 1.5
+  trend_pot_quantile: 0.99
+  trend_pot_multiplier: 1.5
+  confidence_threshold: 0.6
+  max_missing_frac: 0.5
+  drift_residual_z: 1.5
+
+torai:
+  resample_s: 15
+  gamma: 5
+  bins: 5
+  localized: true
+  random_state: 0
+  gmm_max_iter: 50
+  variant: fast            # faithful|fast (identical numerics; fast = vectorized severity)
+
+ws:
+  warmup_seconds: 90       # /anomaly: BASE-stream buffer before first fit
+  stride_seconds: 30       # /anomaly: score cadence (sliding window)
+  window_seconds: 60       # /anomaly: scoring window span
+  win_size: 512            # Time-RCD input length (default 5000 pads short windows)
+  fuse_w: 0.3              # Time-RCD-Fuse robust-z fusion weight
+  threshold: 0.5           # fused-score binarization threshold
+
+compute:
+  profile: smoke              # smoke|quick|standard|full
+  workers: 1
+  max_cases: 20
+  cache: true
+  cache_dir: results/cache
+
+experiments:
+  seeds: [7, 11, 19]
+budget:
+  max_window_ms: 50
+  max_rss_mb: 200
+  max_cpu_pct: 5
+  max_bandwidth_kbps: 16

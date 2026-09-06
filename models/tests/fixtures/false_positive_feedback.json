@@ -1,0 +1,11 @@
+{
+ "feedback": {
+  "feedback_id": "fb-0001",
+  "incident_id": "inc-4170000000000-4530000000000-cpu.utilization-90b46d4d",
+  "actor": "operator",
+  "label": "false_positive",
+  "target_id": "cpu.utilization",
+  "created_at_ns": 1700000000000000000,
+  "model_version": "0.4.0"
+ }
+}
