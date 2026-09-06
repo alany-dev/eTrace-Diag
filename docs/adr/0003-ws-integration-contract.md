@@ -25,6 +25,11 @@
      通道 med/MAD/q99 与融合归一化参数；预热期间一律 `is_anomaly=false` 并附
      `indicators:[{type:"warmup", confidence:0}]`。
    - 打分节奏：按 `stride_ns`（默认 30s）滑窗打分一次，非逐 tick（控制 CPU 开销）。
+   - **线上校准（联调实测，区别于 SMD 离线先验）**：`win_size=512`（默认 5000
+     会把短窗 padding 到 5000，CPU 推理 3–35s）；判定 = `fused > 0.25` 或平滑
+     robust-z `zn > 0.95`（q99 锚定，短窗上零样本分弱时的确定性证据，median-k5
+     平滑后取门）；checkpoint 在服务启动时预加载（懒加载会使首个打分超过采集器
+     5s 回复超时）。
    - 异常类型映射：Robust-z 逐通道最大离差 → 通道组（cpu/io/mem/lock/net 五组）
      取最高组为 `type`；`indicators` 携带逐组置信度。
 3. **/causal 协议**：
