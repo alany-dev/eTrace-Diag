@@ -81,6 +81,17 @@ struct bpf_timer {
 #define TCP_CLOSING 11
 
 // ===========================================================================
+// Syscall argument registers — per-arch pt_regs member names.
+// ===========================================================================
+#ifdef __TARGET_ARCH_arm64
+#define ETD_SYSCALL_ARG1(regs) BPF_CORE_READ(regs, regs[1])
+#define ETD_SYSCALL_ORIG_NR(regs) BPF_CORE_READ(regs, __syscallnr)
+#else
+#define ETD_SYSCALL_ARG1(regs) BPF_CORE_READ(regs, si)  // x86_64: rsi = 2nd arg
+#define ETD_SYSCALL_ORIG_NR(regs) BPF_CORE_READ(regs, orig_ax)
+#endif
+
+// ===========================================================================
 // Shared value types
 // ===========================================================================
 struct switch_t { u32 vol; u32 invol; };
@@ -852,10 +863,10 @@ int BPF_PROG(fentry_sys, struct pt_regs *regs, unsigned int nr) {
   if (!deep_mode()) return 0;
   u32 tid = (u32)bpf_get_current_pid_tgid();
   if (!tid_is_target(tid)) return 0;
-  u64 id = BPF_CORE_READ(regs, orig_ax);
+  u64 id = ETD_SYSCALL_ORIG_NR(regs);
   u8 futex_wait = 0;
   if (id == ETD_NR_FUTEX) {
-    unsigned long arg1 = BPF_CORE_READ(regs, si);  // x86_64: rsi = 2nd arg
+    unsigned long arg1 = ETD_SYSCALL_ARG1(regs);
     u64 cmd = arg1 & FUTEX_CMD_MASK;
     if (cmd == FUTEX_WAIT || cmd == FUTEX_WAIT_BITSET) futex_wait = 1;
   }
@@ -891,12 +902,7 @@ int BPF_PROG(on_sys_enter, struct pt_regs *regs, long id) {
 
   u8 futex_wait = 0;
   if (id == ETD_NR_FUTEX) {
-    unsigned long arg1;
-#ifdef __TARGET_ARCH_arm64
-    arg1 = BPF_CORE_READ(regs, regs[1]);
-#else
-    arg1 = BPF_CORE_READ(regs, si);  // x86_64: rsi = 2nd syscall arg
-#endif
+    unsigned long arg1 = ETD_SYSCALL_ARG1(regs);
     u64 cmd = arg1 & FUTEX_CMD_MASK;
     if (cmd == FUTEX_WAIT || cmd == FUTEX_WAIT_BITSET) futex_wait = 1;
   }
