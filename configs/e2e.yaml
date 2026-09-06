@@ -28,5 +28,7 @@ ws:
   warmup_seconds: 60       # e2e: 60s 正常基线后开始打分
   stride_seconds: 20       # e2e: 90s 注入期内至少 3 个打分窗
   window_seconds: 60
+  win_size: 512            # Time-RCD 输入长度（默认 5000 会把短窗 padding 到 5000，CPU 推理 3-35s）
   fuse_w: 0.3
-  threshold: 0.5
+  threshold: 0.25          # 线上阈值（0.5 为 SMD 离线先验；线上实测基线 ~0.05 vs 注入 ~0.3）
+  zn_threshold: 0.95       # robust-z 通道偏离门（q99 校准；短窗上零样本分弱时的确定性证据）

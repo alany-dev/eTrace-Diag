@@ -36,6 +36,7 @@ ws:
   warmup_seconds: 90       # /anomaly: BASE-stream buffer before first fit
   stride_seconds: 30       # /anomaly: score cadence (sliding window)
   window_seconds: 60       # /anomaly: scoring window span
+  win_size: 512            # Time-RCD input length (default 5000 pads short windows)
   fuse_w: 0.3              # Time-RCD-Fuse robust-z fusion weight
   threshold: 0.5           # fused-score binarization threshold
 

@@ -43,6 +43,7 @@ class TimeRCDFuseDetector(BaseDetector):
         device: str | None = None,
         fuse_w: float = 0.3,
         threshold: float = 0.5,
+        zn_threshold: float = 0.95,
         median_k: int = 5,
         window_ns: int = 60_000_000_000,
         stride_ns: int = 30_000_000_000,
@@ -54,6 +55,7 @@ class TimeRCDFuseDetector(BaseDetector):
         self.device = device
         self.fuse_w = fuse_w
         self.threshold = threshold
+        self.zn_threshold = zn_threshold
         self.median_k = median_k
         self.window_ns = window_ns
         self.stride_ns = stride_ns
@@ -77,10 +79,18 @@ class TimeRCDFuseDetector(BaseDetector):
                     win_size=self.win_size, device=self.device,
                 )
             else:
-                self._det = TimeRCDDetector.from_pretrained(
-                    variant=self.time_rcd_variant, win_size=self.win_size,
-                    device=self.device,
-                )
+                try:
+                    # prefer the local HF cache (offline; setup_openkylin.sh /
+                    # the e2e deployment prefetch the checkpoint)
+                    self._det = TimeRCDDetector.from_pretrained(
+                        variant=self.time_rcd_variant, win_size=self.win_size,
+                        device=self.device, local_files_only=True,
+                    )
+                except Exception:
+                    self._det = TimeRCDDetector.from_pretrained(
+                        variant=self.time_rcd_variant, win_size=self.win_size,
+                        device=self.device,
+                    )
         return self._det
 
     def fit(
@@ -152,17 +162,24 @@ class TimeRCDFuseDetector(BaseDetector):
         # robust-z fusion
         z_test = self._robust_z(mat)
         zn = np.minimum(1.0, z_test / self._q99)
+        self._last_zn = zn
         fused = (1.0 - self.fuse_w) * raw + self.fuse_w * zn
-        # median-k5 smoothing
+        # median-k5 smoothing (fused + zn both smoothed; the zn gate is the
+        # deterministic channel-deviation evidence when the zero-shot raw
+        # scores are weak on short live windows)
         from scipy.ndimage import median_filter
 
         smooth = median_filter(fused, size=self.median_k)
-        return self._segments(smooth, ts, mat)
+        zn_smooth = median_filter(zn, size=self.median_k)
+        self._last_fused = smooth
+        self._last_zn = zn
+        flag = (smooth > self.threshold) | (zn_smooth > self.zn_threshold)
+        severity = np.maximum(smooth, zn_smooth)
+        return self._segments(flag, severity, ts, mat)
 
     def _segments(
-        self, smooth: np.ndarray, ts: np.ndarray, mat: np.ndarray
+        self, flag: np.ndarray, severity: np.ndarray, ts: np.ndarray, mat: np.ndarray
     ) -> list[IncidentWindow]:
-        flag = smooth > self.threshold
         if not flag.any():
             return []
         incidents: list[IncidentWindow] = []
@@ -174,10 +191,10 @@ class TimeRCDFuseDetector(BaseDetector):
             j = i
             while j + 1 < len(flag) and flag[j + 1]:
                 j += 1
-            peak = int(np.argmax(smooth[i : j + 1])) + i
+            peak = int(np.argmax(severity[i : j + 1])) + i
             start_ns = int(ts[i])
             end_ns = int(ts[j])
-            severity = float(min(1.0, smooth[peak]))
+            sev = float(min(1.0, severity[peak]))
             # per-channel contribution at the peak tick (normalized to sum 1)
             denom = 1.4826 * np.maximum(self._mad, 1e-8)
             zc = np.abs(mat[peak] - self._med) / denom
@@ -197,8 +214,8 @@ class TimeRCDFuseDetector(BaseDetector):
                 start_ts_ns=start_ns,
                 end_ts_ns=end_ns,
                 detected_at_ns=int(ts[peak]),
-                status="anomaly" if severity >= self.threshold + 0.1 else "uncertain",
-                severity=severity,
+                status="anomaly" if sev >= 0.5 else "uncertain",
+                severity=sev,
                 metric_scores=metric_scores,
                 directions=directions,
                 model_version=self.model_version,

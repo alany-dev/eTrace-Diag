@@ -55,6 +55,10 @@ class ToraiConfig:
     localized: bool = True
     random_state: int = 0
     gmm_max_iter: int = 50
+    max_cols: int = 64  # live guard: truncate cluster tables to top-N variance
+                         # columns before Psi-PC (O(cols^2) blowup on wide
+                         # single-host evidence; same measure as the AIOps
+                         # adapter's --max-cols 50, perf-only)
     variant: str = "fast"  # "faithful" = per-column reference; "fast" = vectorized
 
     def __post_init__(self) -> None:
@@ -282,7 +286,8 @@ def _logs_to_table(logs: tuple[LogEvent, ...]) -> pd.DataFrame:
         sec = log.ts_ns // 1_000_000_000
         ts.add(sec)
         col = f"{log.entity_id}_{log.template_id}"
-        cols.setdefault(col, {})[sec] = cols[col].get(sec, 0.0) + 1.0
+        d = cols.setdefault(col, {})
+        d[sec] = d.get(sec, 0.0) + 1.0
     ordered = sorted(ts)
     rows = {"time": ordered}
     for col, d in cols.items():
@@ -300,10 +305,12 @@ def _traces_to_tables(traces: tuple[TraceSpan, ...]) -> tuple[pd.DataFrame, pd.D
         sec = sp.start_ts_ns // 1_000_000_000
         ts.add(sec)
         svc = sp.service_name
-        err_cols.setdefault(svc, {})[sec] = err_cols[svc].get(sec, 0.0) + (
+        ed = err_cols.setdefault(svc, {})
+        ed[sec] = ed.get(sec, 0.0) + (
             0.0 if sp.status in (None, "", "OK", "ok") else 1.0
         )
-        lat_cols.setdefault(svc, {}).setdefault(sec, []).append(sp.end_ts_ns - sp.start_ts_ns)
+        ld = lat_cols.setdefault(svc, {}).setdefault(sec, [])
+        ld.append(sp.end_ts_ns - sp.start_ts_ns)
     ordered = sorted(ts)
     err_rows = {"time": ordered}
     lat_rows = {"time": ordered}
@@ -443,6 +450,8 @@ class ToraiRCA:
 
         # ---- logts ----
         logts = _drop_constant(logts)
+        if "time" not in logts.columns:  # degenerate single-row frame
+            logts = pd.DataFrame(columns=["time"])
         normal_logts = logts[logts["time"] < inject_s]
         anomal_logts = logts[logts["time"] >= inject_s]
         normal_logts = _drop_time(normal_logts)
@@ -452,6 +461,10 @@ class ToraiRCA:
         if has_traces:
             traces_err = _drop_constant(traces_err.ffill().fillna(0))
             traces_lat = _drop_constant(traces_lat.ffill().fillna(0))
+            if "time" not in traces_err.columns:
+                traces_err = pd.DataFrame(columns=["time"])
+            if "time" not in traces_lat.columns:
+                traces_lat = pd.DataFrame(columns=["time"])
             normal_te = _drop_time(traces_err[traces_err["time"] < inject_s])
             anomal_te = _drop_time(traces_err[traces_err["time"] >= inject_s])
             # faithful: normal side of traces_err drops last 2 rows
@@ -559,6 +572,7 @@ class ToraiRCA:
                 localized=cfg.localized,
                 bins=cfg.bins,
                 resample_s=cfg.resample_s,
+                max_cols=cfg.max_cols,
             )
             tmp_ranks = [s.split("_")[0] for s in tmp_ranks]
             internal = []
@@ -621,6 +635,7 @@ class ToraiRCA:
         localized: bool = True,
         bins: int = 5,
         resample_s: int = 15,
+        max_cols: int = 64,
         seed: int | None = None,
     ) -> list[str]:
         """RCD on a metric+logts cluster subset (faithful port)."""
@@ -652,6 +667,15 @@ class ToraiRCA:
 
         if normal_df.empty or anomal_df.empty:
             return []
+
+        # Live single-host guard: per-cluster tables can carry ~1000 columns
+        # (entities x metrics); Psi-PC scales ~O(cols^2). Keep the max_cols
+        # highest-variance columns (perf-only, documented in ToraiConfig).
+        if normal_df.shape[1] > max_cols:
+            var = pd.concat([normal_df, anomal_df]).var(axis=0, skipna=True)
+            keep = list(var.sort_values(ascending=False).index[:max_cols])
+            normal_df = normal_df[keep]
+            anomal_df = anomal_df[keep]
 
         return psi_pc.run_multi_phase(
             normal_df,

@@ -229,6 +229,8 @@ class AnomalySession:
         self.detector = TimeRCDFuseDetector(
             fuse_w=float(ws.get("fuse_w", 0.3)),
             threshold=float(ws.get("threshold", 0.5)),
+            zn_threshold=float(ws.get("zn_threshold", 0.95)),
+            win_size=int(ws.get("win_size", 512)),
             window_ns=self.window_ns,
             stride_ns=self.stride_ns,
         )
@@ -260,21 +262,33 @@ class AnomalySession:
                 return None
             try:
                 train = self._frame(self.buffer)
+                t0 = time.time()
                 await asyncio.to_thread(self.detector.fit, train, None, seed=7)
+                print(f"[anomaly] fit done in {time.time()-t0:.1f}s "
+                      f"rows={len(train.points)} q99={self.detector._q99:.3f}",
+                      flush=True)
                 self.fit_done = True
                 self.last_score_ts_ns = now_ns
                 return None  # first scoring happens next stride
             except Exception as exc:  # model load/download failure -> stay silent
-                app.state.last_error = f"fit failed: {exc}"
+                print(f"[anomaly] fit failed: {exc}", flush=True)
                 return None
         if now_ns - self.last_score_ts_ns < self.stride_ns:
             return None
         self.last_score_ts_ns = now_ns
         window = [p for p in self.buffer if now_ns - p.ts_ns <= self.window_ns * 2]
         try:
+            t0 = time.time()
             incidents = await asyncio.to_thread(self.detector.score, self._frame(window))
+            fused = getattr(self.detector, "_last_fused", None)
+            zn = getattr(self.detector, "_last_zn", None)
+            print(f"[anomaly] score in {time.time()-t0:.1f}s "
+                  f"pts={len(window)} incidents={len(incidents)} "
+                  f"fused_max={float(np.max(fused)) if fused is not None else '?'} "
+                  f"zn_max={float(np.max(zn)) if zn is not None else '?'}",
+                  flush=True)
         except Exception as exc:
-            app.state.last_error = f"score failed: {exc}"
+            print(f"[anomaly] score failed: {exc}", flush=True)
             return None
         if not incidents:
             return None
@@ -419,20 +433,60 @@ def run_causal(cfg: dict, body: dict, seed: int = 7) -> dict:
 # WS endpoints
 # ---------------------------------------------------------------------------
 
+_SESSION_LOCK = __import__("threading").Lock()
+_SESSION: "AnomalySession | None" = None
+
+
+def _get_session() -> AnomalySession:
+    """One session per server process: collector reconnects (WS transport
+    errors/timeouts) must reuse the fitted detector instead of re-fitting on
+    a stress-contaminated buffer."""
+    global _SESSION
+    with _SESSION_LOCK:
+        if _SESSION is None:
+            _SESSION = AnomalySession(_load_cfg())
+        return _SESSION
+
+
+@app.on_event("startup")
+def _preload_checkpoint() -> None:
+    """Eagerly load the Time-RCD checkpoint at startup so the first scoring
+    tick never pays the load cost (would exceed the collector's 5s reply
+    timeout and trigger a reconnect/re-fit)."""
+    import threading
+
+    def _load() -> None:
+        t0 = time.time()
+        try:
+            _get_session().detector._ensure_model()
+            print(f"[anomaly] checkpoint preloaded in {time.time()-t0:.1f}s",
+                  flush=True)
+        except Exception as exc:
+            print(f"[anomaly] checkpoint preload failed: {exc}", flush=True)
+
+    threading.Thread(target=_load, daemon=True).start()
+
+
 @app.websocket("/anomaly")
 async def ws_anomaly(ws: WebSocket) -> None:
     await ws.accept()
-    cfg = _load_cfg()
-    session = AnomalySession(cfg)
+    session = _get_session()
     try:
         while True:
             raw = await ws.receive_text()
+            print(f"[anomaly] recv {len(raw)} bytes", flush=True)
             try:
                 msg = json_loads(raw)
-            except ValueError:
+            except ValueError as exc:
+                print(f"[anomaly] bad json: {exc}", flush=True)
                 continue
-            session.ingest(msg)
-            now_ns = time.time_ns()
+            try:
+                session.ingest(msg)
+            except Exception:
+                import traceback
+                traceback.print_exc()
+                continue
+            now_ns = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
             if not session.fit_done:
                 span = now_ns - (session.buffer[0].ts_ns if session.buffer else now_ns)
                 if span < int(session.warmup_seconds * 1e9):
@@ -473,6 +527,8 @@ async def ws_causal(ws: WebSocket) -> None:
                 result = await asyncio.to_thread(run_causal, cfg, body)
             except Exception as exc:
                 result = {"ok": False, "abstained_reason": f"causal analysis failed: {exc}"}
+            print(f"[causal] ok={result.get('ok')} "
+                  f"{result.get('abstained_reason', '')}", flush=True)
             await ws.send_text(json_dumps({"v": 1, "seq": seq, **result}))
     except WebSocketDisconnect:
         return
