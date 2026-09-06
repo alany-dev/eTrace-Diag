@@ -265,9 +265,22 @@ bool EbpfManager::ArmTimer(u64 interval_ms, bool cancel) {
 
   struct bpf_test_run_opts opts = {};
   opts.sz = sizeof(opts);
-  opts.repeat = 1;
+  opts.repeat = 0;  // syscall progs reject repeat>0 on 6.6+
   int err = bpf_prog_test_run_opts(fd, &opts);
-  if (err && errno) LogWarn("arm_snapshotter test_run: %s", strerror(errno));
+  if (err) {
+    // Kernel >= 6.6 removed test_run for BPF_PROG_TYPE_SYSCALL; creating a
+    // link executes the program once at attach time (timer keeps running
+    // after the link is closed).
+    LogWarn("arm_snapshotter test_run: %s; falling back to link create",
+            errno ? strerror(errno) : "error");
+    int link = bpf_link_create(fd, 0, (enum bpf_attach_type)0, 0);
+    if (link < 0) {
+      LogWarn("arm_snapshotter link create: %s", strerror(errno));
+      return false;
+    }
+    close(link);
+    err = 0;
+  }
   return err == 0;
 }
 

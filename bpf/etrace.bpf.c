@@ -662,10 +662,12 @@ int BPF_PROG(on_mark_victim, int pid) {
   if (!seqp) return 0;
   u32 seq = *seqp; *seqp = seq + 1;  // best-effort ring append (rare event)
   u32 ix = seq & (OOM_EVENTS_CAP - 1);
-  struct oom_event_t ev;
-  ev.ts = bpf_ktime_get_ns();
-  ev.pid = (u32)pid;
-  bpf_map_update_elem(&oom_events, &ix, &ev, BPF_ANY);
+  // ARRAY map: lookup always succeeds; write fields directly into the map
+  // value (mixed-width stack struct stores trip the 6.6+ verifier).
+  struct oom_event_t *ev = bpf_map_lookup_elem(&oom_events, &ix);
+  if (!ev) return 0;
+  ev->ts = bpf_ktime_get_ns();
+  ev->pid = (u32)pid;
   return 0;
 }
 
@@ -1218,6 +1220,7 @@ int BPF_KRETPROBE(kretprobe_inet_csk_accept, int ret) {
 // tp_btf/inet_sock_set_state — flow start/close.
 SEC("tp_btf/inet_sock_set_state")
 int BPF_PROG(net_sock_state, const struct sock *sk, int oldstate, int newstate) {
+  if (!sk) return 0;
   if (!deep_mode()) return 0;
   if (newstate == 2 /*TCP_SYN_SENT*/ || newstate == 1 /*TCP_ESTABLISHED*/) {
     // ownership is set by connect/accept hooks; nothing to do on SYN.
@@ -1248,6 +1251,7 @@ int BPF_PROG(net_sock_state, const struct sock *sk, int oldstate, int newstate) 
 SEC("tp_btf/tcp_retransmit_skb")
 int BPF_PROG(net_tcp_retransmit, const struct sock *sk, const struct sk_buff *skb) {
   (void)skb;
+  if (!sk) return 0;
   if (!deep_mode()) return 0;
   u64 cookie = bpf_get_socket_cookie((struct sock *)sk);
   if (!cookie) return 0;
@@ -1260,6 +1264,7 @@ int BPF_PROG(net_tcp_retransmit, const struct sock *sk, const struct sk_buff *sk
 SEC("tp_btf/tcp_send_reset")
 int BPF_PROG(net_tcp_send_reset, const struct sock *sk, struct sk_buff *skb) {
   (void)skb;
+  if (!sk) return 0;
   if (!deep_mode()) return 0;
   u64 cookie = bpf_get_socket_cookie((struct sock *)sk);
   if (!cookie) return 0;
@@ -1279,6 +1284,7 @@ int BPF_PROG(net_tcp_send_reset, const struct sock *sk, struct sk_buff *skb) {
 SEC("tp_btf/kfree_skb")
 int BPF_PROG(net_kfree_skb, struct sk_buff *skb, void *location, unsigned short protocol) {
   (void)location;
+  if (!skb) return 0;
   if (!deep_mode()) return 0;
   u32 zero = 0;
   struct sample_rate_cfg *rc = bpf_map_lookup_elem(&sample_rate_cfg, &zero);
@@ -1410,6 +1416,54 @@ static __always_inline long rec_commit(struct snapshot_rec *scr, u64 now, bool d
 
 #ifdef ETD_HAVE_PERCPU_LOOKUP_ELEM
 // ---- >= 6.4: timer producer (sums a target across CPUs) ----
+struct snap_sum_ctx {
+  struct snapshot_rec *scr;
+  u32 tid;
+};
+
+static long snap_sum_cpu(u32 cpu, void *vctx) {
+  struct snap_sum_ctx *c = vctx;
+  struct snapshot_rec *scr = c->scr;
+  u32 tid = c->tid;
+  u64 *v = bpf_map_lookup_percpu_elem(&on_cpu_ns, &tid, cpu);
+  if (v) scr->on_cpu_ns += *v;
+  struct switch_t *sw = bpf_map_lookup_percpu_elem(&switches, &tid, cpu);
+  if (sw) { scr->nr_sw_vol += sw->vol; scr->nr_sw_invol += sw->invol; }
+  struct blk_io_t *bi = bpf_map_lookup_percpu_elem(&block_io, &tid, cpu);
+  if (bi) {
+    scr->io_ops += bi->ops; scr->io_bytes += bi->bytes;
+    #pragma unroll
+    for (int i = 0; i < HIST13_BINS; i++) scr->io_hist[i] += bi->hist[i];
+  }
+  struct faults_t *ft = bpf_map_lookup_percpu_elem(&faults, &tid, cpu);
+  if (ft) { scr->pf_minor += ft->minor; scr->pf_major += ft->major; }
+  struct lat_stat *ls = bpf_map_lookup_percpu_elem(&lock_st, &tid, cpu);
+  if (ls) {
+    scr->lock_waits += ls->count; scr->lock_lat_ns += ls->lat_sum;
+    #pragma unroll
+    for (int i = 0; i < HIST13_BINS; i++) scr->lock_hist[i] += ls->hist[i];
+  }
+  struct lat_stat *ss = bpf_map_lookup_percpu_elem(&sys_st, &tid, cpu);
+  if (ss) {
+    scr->syscall_count += ss->count; scr->syscall_lat_ns += ss->lat_sum;
+    #pragma unroll
+    for (int i = 0; i < HIST13_BINS; i++) scr->syscall_hist[i] += ss->hist[i];
+  }
+  struct lat_stat *fs = bpf_map_lookup_percpu_elem(&futex_st, &tid, cpu);
+  if (fs) {
+    scr->futex_waits += fs->count; scr->futex_lat_ns += fs->lat_sum;
+    #pragma unroll
+    for (int i = 0; i < HIST13_BINS; i++) scr->futex_hist[i] += fs->hist[i];
+  }
+  struct lat_stat *rs = bpf_map_lookup_percpu_elem(&runq_st, &tid, cpu);
+  if (rs) {
+    scr->runq_wait_ns += rs->lat_sum; scr->runq_wait_count += (u32)rs->count;
+    #pragma unroll
+    for (int i = 0; i < HIST13_BINS; i++) scr->runq_hist[i] += rs->hist[i];
+  }
+  return 0;
+}
+
 static long snap_collect_one(struct bpf_map *map, const void *key, void *value, void *ctx) {
   (void)map; (void)value;
   u32 tid = *(const u32 *)key;
@@ -1421,44 +1475,11 @@ static long snap_collect_one(struct bpf_map *map, const void *key, void *value, 
   if (!scr) return 0;
   __builtin_memset(scr, 0, sizeof(*scr));
 
-  for (u32 cpu = 0; cpu < 1024 && cpu < ncpus; cpu++) {
-    u64 *v = bpf_map_lookup_percpu_elem(&on_cpu_ns, &tid, cpu);
-    if (v) scr->on_cpu_ns += *v;
-    struct switch_t *sw = bpf_map_lookup_percpu_elem(&switches, &tid, cpu);
-    if (sw) { scr->nr_sw_vol += sw->vol; scr->nr_sw_invol += sw->invol; }
-    struct blk_io_t *bi = bpf_map_lookup_percpu_elem(&block_io, &tid, cpu);
-    if (bi) {
-      scr->io_ops += bi->ops; scr->io_bytes += bi->bytes;
-      #pragma unroll
-      for (int i = 0; i < HIST13_BINS; i++) scr->io_hist[i] += bi->hist[i];
-    }
-    struct faults_t *ft = bpf_map_lookup_percpu_elem(&faults, &tid, cpu);
-    if (ft) { scr->pf_minor += ft->minor; scr->pf_major += ft->major; }
-    struct lat_stat *ls = bpf_map_lookup_percpu_elem(&lock_st, &tid, cpu);
-    if (ls) {
-      scr->lock_waits += ls->count; scr->lock_lat_ns += ls->lat_sum;
-      #pragma unroll
-      for (int i = 0; i < HIST13_BINS; i++) scr->lock_hist[i] += ls->hist[i];
-    }
-    struct lat_stat *ss = bpf_map_lookup_percpu_elem(&sys_st, &tid, cpu);
-    if (ss) {
-      scr->syscall_count += ss->count; scr->syscall_lat_ns += ss->lat_sum;
-      #pragma unroll
-      for (int i = 0; i < HIST13_BINS; i++) scr->syscall_hist[i] += ss->hist[i];
-    }
-    struct lat_stat *fs = bpf_map_lookup_percpu_elem(&futex_st, &tid, cpu);
-    if (fs) {
-      scr->futex_waits += fs->count; scr->futex_lat_ns += fs->lat_sum;
-      #pragma unroll
-      for (int i = 0; i < HIST13_BINS; i++) scr->futex_hist[i] += fs->hist[i];
-    }
-    struct lat_stat *rs = bpf_map_lookup_percpu_elem(&runq_st, &tid, cpu);
-    if (rs) {
-      scr->runq_wait_ns += rs->lat_sum; scr->runq_wait_count += (u32)rs->count;
-      #pragma unroll
-      for (int i = 0; i < HIST13_BINS; i++) scr->runq_hist[i] += rs->hist[i];
-    }
-  }
+  // bpf_loop over CPUs: a runtime-bounded `for` explodes the 6.6+ verifier's
+  // jump-sequence limit inside the timer callback.
+  if (ncpus > 1024) ncpus = 1024;
+  struct snap_sum_ctx sctx = {.scr = scr, .tid = tid};
+  bpf_loop(ncpus, snap_sum_cpu, &sctx, 0);
 
   rec_set_meta(scr, tid);
   return rec_commit(scr, c->now, c->deep);

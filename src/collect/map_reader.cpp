@@ -74,34 +74,46 @@ void MapSlice::ForEach(std::function<void(const void*, const void*)> fn) const {
 }
 
 void MapSlice::Drain(std::function<void(const void*, const void*)> fn) const {
-  // Always take the FIRST key, read it, invoke fn, then delete it — safe under
-  // concurrent modification, robust across kernels (no batch API).
-  std::vector<uint8_t> key(key_size_);
+  // Iterate with the previous key (never restart from NULL after a delete),
+  // so concurrent inserts cannot starve the loop; cap iterations per call so
+  // a continuously-filled map resumes on the next periodic tick instead of
+  // spinning forever.
+  constexpr uint32_t kMaxDrainIterations = 8192;
+  std::vector<uint8_t> prev(key_size_), cur(key_size_);
   std::vector<uint8_t> buf(percpu_ ? pcpu_stride_ : value_size_);
   std::vector<uint8_t> summed(value_size_);
+  uint32_t iterations = 0;
   for (;;) {
-    if (bpf_map_get_next_key(fd_, nullptr, key.data()) != 0) break;
+    if (++iterations > kMaxDrainIterations) break;
+    const void* prevp = iterations > 1 ? prev.data() : nullptr;
+    if (bpf_map_get_next_key(fd_, prevp, cur.data()) != 0) break;
     if (percpu_) {
-      if (bpf_map_lookup_elem(fd_, key.data(), buf.data()) != 0) break;
+      if (bpf_map_lookup_elem(fd_, cur.data(), buf.data()) != 0) break;
       std::memset(summed.data(), 0, value_size_);
       for (int cpu = 0; cpu < ncpus_; ++cpu) {
         const uint8_t* src = buf.data() + (size_t)cpu * aligned_;
         for (int b = 0; b < (int)value_size_; ++b) summed[b] += src[b];
       }
-      fn(key.data(), summed.data());
+      fn(cur.data(), summed.data());
     } else {
-      if (bpf_map_lookup_elem(fd_, key.data(), buf.data()) != 0) break;
-      fn(key.data(), buf.data());
+      if (bpf_map_lookup_elem(fd_, cur.data(), buf.data()) != 0) break;
+      fn(cur.data(), buf.data());
     }
-    bpf_map_delete_elem(fd_, key.data());
+    bpf_map_delete_elem(fd_, cur.data());
+    std::swap(prev, cur);
   }
 }
 
 void MapSlice::Wipe() const {
-  std::vector<uint8_t> key(key_size_);
+  constexpr uint32_t kMaxWipeIterations = 8192;
+  std::vector<uint8_t> prev(key_size_), cur(key_size_);
+  uint32_t iterations = 0;
   for (;;) {
-    if (bpf_map_get_next_key(fd_, nullptr, key.data()) != 0) break;
-    bpf_map_delete_elem(fd_, key.data());
+    if (++iterations > kMaxWipeIterations) break;
+    const void* prevp = iterations > 1 ? prev.data() : nullptr;
+    if (bpf_map_get_next_key(fd_, prevp, cur.data()) != 0) break;
+    bpf_map_delete_elem(fd_, cur.data());
+    std::swap(prev, cur);
   }
 }
 

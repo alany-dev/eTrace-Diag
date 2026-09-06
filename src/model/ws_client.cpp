@@ -244,11 +244,21 @@ bool WsClient::RecvText(std::string& out, uint64_t timeout_ms) {
       case 0x8:  // close
         Close();
         return false;
-      case 0x9: {  // ping -> pong
-        unsigned char hdr[2] = {0x8A, (unsigned char)(payload.size() < 126 ? payload.size() : 126)};
-        if (send(fd_, hdr, 2, 0) != 2) return false;
-        if (!payload.empty() && send(fd_, payload.data(), payload.size(), 0) != (ssize_t)payload.size())
-          return false;
+      case 0x9: {  // ping -> pong (client frames MUST be masked, RFC 6455 §5.1)
+        unsigned char hdr[2] = {0x8A, (unsigned char)(0x80u | payload.size())};
+        unsigned char mk[4] = {
+            (unsigned char)(mask_key_ >> 24), (unsigned char)(mask_key_ >> 16),
+            (unsigned char)(mask_key_ >> 8), (unsigned char)(mask_key_ & 0xFF)};
+        std::vector<unsigned char> pong(hdr, hdr + 2);
+        pong.insert(pong.end(), mk, mk + 4);
+        for (size_t i = 0; i < payload.size(); ++i)
+          pong.push_back((unsigned char)(payload[i] ^ mk[i % 4]));
+        size_t sent = 0;
+        while (sent < pong.size()) {
+          ssize_t r = send(fd_, pong.data() + sent, pong.size() - sent, 0);
+          if (r <= 0) return false;
+          sent += (size_t)r;
+        }
         break;
       }
       case 0xA:  // pong
