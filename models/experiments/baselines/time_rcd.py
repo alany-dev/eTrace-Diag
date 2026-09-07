@@ -444,10 +444,77 @@ MODULE_NOTES = {
 }
 
 
+def segment_metrics(score_t: np.ndarray, labels: np.ndarray) -> dict:
+    """Range/segment P/R/F1 (overlap >=1 predicted point in a labeled segment)."""
+    pred = score_t > 0
+    true = labels > 0
+    segs: list[tuple[int, int]] = []
+    in_seg = False
+    for i, v in enumerate(true):
+        if v and not in_seg:
+            segs.append([i, i])
+            in_seg = True
+        elif v and in_seg:
+            segs[-1][1] = i
+        elif not v:
+            in_seg = False
+    psegs: list[tuple[int, int]] = []
+    in_seg = False
+    for i, v in enumerate(pred):
+        if v and not in_seg:
+            psegs.append([i, i])
+            in_seg = True
+        elif v and in_seg:
+            psegs[-1][1] = i
+        elif not v:
+            in_seg = False
+    if not segs or not psegs:
+        return {"seg_precision": 0.0, "seg_recall": 0.0, "seg_f1": 0.0}
+    tp_seg = sum(1 for (a, b) in psegs if any(a <= c <= b or a <= d <= b for (c, d) in segs) or any(c <= a <= d for (c, d) in segs))
+    prec = tp_seg / len(psegs)
+    rec = tp_seg / len(segs)
+    return {
+        "seg_precision": prec,
+        "seg_recall": rec,
+        "seg_f1": 2 * prec * rec / (prec + rec) if (prec + rec) else 0.0,
+    }
+
+
+def point_f1(score_t: np.ndarray, labels: np.ndarray) -> dict:
+    pred = score_t > 0
+    true = labels > 0
+    tp = int((pred & true).sum())
+    fp = int((pred & ~true).sum())
+    fn = int((~pred & true).sum())
+    prec = tp / (tp + fp) if (tp + fp) else 0.0
+    rec = tp / (tp + fn) if (tp + fn) else 0.0
+    f1 = 2 * prec * rec / (prec + rec) if (prec + rec) else 0.0
+    return {"point_precision": prec, "point_recall": rec, "point_f1": f1}
+
+
+def vus_pr(score_t: np.ndarray, labels: np.ndarray, n_thresh: int = 100) -> float:
+    """Volume under the precision-recall surface (interval-aware proxy)."""
+    pred_vals = score_t
+    true = labels > 0
+    prs = []
+    for q in np.linspace(0.0, 1.0, n_thresh):
+        thr = float(np.quantile(pred_vals, 1 - q)) if pred_vals.size else 0.0
+        pred = pred_vals >= thr
+        tp = int((pred & true).sum())
+        fp = int((pred & ~true).sum())
+        fn = int((~pred & true).sum())
+        prec = tp / (tp + fp) if (tp + fp) else 0.0
+        rec = tp / (tp + fn) if (tp + fn) else 0.0
+        prs.append((prec, rec))
+    area = 0.0
+    for i in range(1, len(prs)):
+        area += 0.5 * (prs[i][0] + prs[i - 1][0]) * abs(prs[i][1] - prs[i - 1][1])
+    return area
+
+
 def run(args) -> dict:
     import torch
 
-    from experiments.run_detection import point_f1, segment_metrics, vus_pr
     from time_rcd.detector import TimeRCDDetector
 
     data_root = Path(args.data_root)

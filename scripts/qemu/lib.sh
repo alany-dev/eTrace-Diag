@@ -11,25 +11,25 @@
 #   http://archive.build.openkylin.top/openkylin/dists/nile/main/binary-<debarch>/
 set -euo pipefail
 
-QEMU_ROOT="${QEMU_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+QEMU_ROOT="${QEMU_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 QEMU_DATA="${QEMU_DATA:-$QEMU_ROOT/build/qemu}"
 REPO_HOST_DIR="${REPO_HOST_DIR:-$QEMU_ROOT}"
 MIRROR="${MIRROR:-http://archive.build.openkylin.top/openkylin}"
 SUITE="${SUITE:-nile}"
 GUEST_ROOT_PW="${GUEST_ROOT_PW:-root}"
-SSH_BASE_PORT="${SSH_BASE_PORT:-2222}"
+SSH_BASE_PORT="${SSH_BASE_PORT:-0}"
 
 # debarch | kernelpkg (empty = linux-image-virtual meta) | qemu bin | machine | cpu args | console | ssh port offset | accel
 arch_cfg() {
   case "$1" in
     x86_64)
-      echo "amd64|linux-image-unsigned-6.6.0-15-generic|qemu-system-x86_64|pc|accel=kvm -cpu host|ttyS0|0|kvm" ;;
+      echo "amd64|linux-image-unsigned-6.6.0-15-generic|qemu-system-x86_64|pc|accel=kvm -cpu host|ttyS0|2222|kvm" ;;
     arm64)
-      echo "arm64|linux-image-unsigned-6.6.0-15-generic|qemu-system-aarch64|virt|-cpu max|ttyAMA0|1|tcg" ;;
+      echo "arm64|linux-image-unsigned-6.6.0-15-generic|qemu-system-aarch64|virt|-cpu max|ttyAMA0|2223|tcg" ;;
     loong64)
-      echo "loong64|linux-image-6.6.0-15-generic|qemu-system-loongarch64|virt|-cpu max|ttyS0|2|tcg" ;;
+      echo "loong64|linux-image-6.6.0-15-generic|qemu-system-loongarch64|virt|-cpu max|ttyS0|2224|tcg" ;;
     riscv64)
-      echo "riscv64|linux-image-5.15.65-rt56+|qemu-system-riscv64|virt|-cpu max|ttyS0|3|tcg" ;;
+      echo "riscv64|linux-image-5.15.65-rt56+|qemu-system-riscv64|virt|-cpu max|ttyS0|2225|tcg" ;;
     *) echo "unknown arch: $1" >&2; return 1 ;;
   esac
 }
@@ -69,15 +69,34 @@ ensure_host_deps() {
 # Build an ext4 disk image from a populated rootfs directory.
 make_disk() { # $1 arch  $2 size_mb
   local dir="$1" size="${2:-4096}"
-  local img disk_mnt
+  local img raw disk_mnt
   img=$(arch_img "$dir")
+  raw="$QEMU_DATA/$(basename "$img" .qcow2).raw.tmp"
   mkdir -p "$(dirname "$img")"
-  rm -f "$img"
-  qemu-img create -f qcow2 "$img" "${size}M" >/dev/null
-  disk_mnt=$(mktemp -d)
-  mkfs.ext4 -F -q "$img" 2>/dev/null || mkfs.ext4 -F "$img"
-  mount "$img" "$disk_mnt"
+  rm -f "$img" "$raw"
+  truncate -s 0 "$raw"
+  dd if=/dev/zero of="$raw" bs=1M count=0 seek="$size" 2>/dev/null
+  mkfs.ext4 -F -q "$raw"
+  # Work dirs MUST live under QEMU_DATA: /tmp can be overlay/automount-backed
+  # and umount of the loop mount there unhooks the shared mount, silently
+  # redirecting later writes (observed as a half-empty guest disk).
+  disk_mnt="$QEMU_DATA/disk_mnt.tmp"
+  rm -rf "$disk_mnt"; mkdir -p "$disk_mnt"
+  mount -o loop "$raw" "$disk_mnt"
   cp -a "$(arch_rootfs "$dir")/." "$disk_mnt/"
+  # Never copy bind-mounted pseudo filesystems (proc/sys/dev hold virtual,
+  # unbounded files such as /proc/kcore).
+  for d in proc sys dev run; do
+    rm -rf "$disk_mnt/$d"
+    mkdir -p "$disk_mnt/$d"
+  done
+  # run-init/switch_root needs static nodes in the new root before udev
+  # (devtmpfs) mounts: without /dev/console the kernel panics post-initramfs.
+  mknod "$disk_mnt/dev/console" c 5 1 2>/dev/null || true
+  mknod "$disk_mnt/dev/null"    c 1 3 2>/dev/null || true
+  mknod "$disk_mnt/dev/tty"     c 5 0 2>/dev/null || true
   umount "$disk_mnt"
   rmdir "$disk_mnt"
+  qemu-img convert -f raw -O qcow2 "$raw" "$img"
+  rm -f "$raw"
 }

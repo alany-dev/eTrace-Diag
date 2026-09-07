@@ -16,8 +16,10 @@ SSHOPTS=(-p "$SSHPORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/nu
 GUEST="root@127.0.0.1"
 PW="$GUEST_ROOT_PW"
 
+SCPOPTS=(-P "$SSHPORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+         -o ConnectTimeout=10)
 g() { sshpass -p "$PW" ssh "${SSHOPTS[@]}" "$GUEST" "$@"; }
-gput() { sshpass -p "$PW" scp "${SSHOPTS[@]}" "$@" "$GUEST:/tmp/"; }
+gput() { sshpass -p "$PW" scp "${SCPOPTS[@]}" "$1" "$GUEST:/tmp/"; }
 
 g "true" || { echo "[$ARCH] ssh not reachable" >&2; exit 1; }
 
@@ -28,17 +30,22 @@ echo "[$ARCH] 2/4 packaging repo -> guest"
 TARBALL="$QEMU_DATA/repo-$ARCH.tar"
 tar -C "$REPO_HOST_DIR" -cf "$TARBALL" \
   --exclude=build --exclude=node_modules --exclude=out_* --exclude=.git \
-  --exclude=__pycache__ --exclude='*.sqlite3*' .
+  --exclude=__pycache__ --exclude='*.sqlite3*' --exclude=models/.venv \
+  --exclude='*.tar*' .
 gput "$TARBALL"
 g 'mkdir -p ~/repo && tar -xf /tmp/repo-*.tar -C ~/repo'
 
 echo "[$ARCH] 3/4 toolchain + build (this is the slow step under TCG)"
-g 'apt-get update -qq >/dev/null 2>&1; apt-get install -y -qq \
-     clang-15 gcc g++ make cmake pkg-config libbpf-dev libelf-dev zlib1g-dev \
-     libsqlite3-dev bpftool python3 websockets >/dev/null 2>&1 || true;
-   cd ~/repo && (PKG=$(apt-cache policy clang-15 | grep -m1 Candidate | awk "{print \$2}"); \
-   [ -n "$PKG" ] && [ "$PKG" != "(none)" ] && apt-get install -y -qq clang-15 >/dev/null 2>&1 || true);
-   export PATH=/usr/local/bin:$PATH; ./scripts/build.sh 2>&1 | tail -2'
+g 'apt-get update -qq >/dev/null 2>&1;
+   # bpftool package name varies (bpftool / linux-tools-* / absent on some suites)
+   BPFTOOL_PKG=bpftool
+   apt-cache show bpftool >/dev/null 2>&1 || BPFTOOL_PKG=""
+   apt-get install -y -qq \
+     clang gcc g++ make cmake pkg-config libbpf-dev libelf-dev zlib1g-dev \
+     libsqlite3-dev python3 python3-websockets $BPFTOOL_PKG >/dev/null 2>&1 || true;
+   for t in clang gcc g++ make cmake python3; do command -v $t >/dev/null || { echo "MISSING-TOOL: $t"; exit 1; }; done;
+   cd ~/repo && ./scripts/build.sh 2>&1 | tail -2;
+   test -x build/etrace-diag || { echo BUILD-FAILED; exit 1; }'
 
 echo "[$ARCH] 4/4 BASE smoke + mock-model DEEP"
 g 'cd ~/repo && OUT=/tmp/qemu_smoke && rm -rf $OUT && mkdir -p $OUT && \
