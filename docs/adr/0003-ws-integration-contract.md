@@ -50,3 +50,24 @@
 - 模型端变更点：WS 路由 + Fuse 运行时模块 + body 解析适配（ADR-0004）。
 - 风险：torch CPU 依赖使模型服务部署体积增大；打分已按 stride 降频，且
   采集器 BASE 自开销不受模型影响（模型是独立进程）。
+
+## 联调实测校准（2026-09-07，openKylin 3.0 主机 + 2.0 guest 双端验证）
+
+- **fentry 依赖内核 BTF 符号**：openKylin 3.0 (7.0.0-2-generic) 的 vmlinux BTF
+  **无 `do_syscall_64`**，fentry attach 报 -EBUSY；guest 6.6.0-15 有。方案：
+  x86 bpf 同时编译 fentry 主路径与 tp_btf/sys_enter+sys_exit fallback，
+  DeepCollector 按 attach 结果自动降级（ADR-0002 拆分后的
+  `etrace_x86.bpf.c` 已含两者）。
+- **持续注入窗口闭合**：90s fio/stress-ng 使模型在 DEEP 全程判 anomaly，
+  `end_debounce_samples=3` 永不触发 → `anomaly_end_ts=0` → 因果 abstain
+  （"no valid anomaly window"）。修复：FinalizeDeep 时 open 窗口以 now 闭合。
+- **anomaly 超时**：首窗打分（checkpoint 预载 + 推理）T0 可 >5s，采集端
+  `timeout_ms=5000` 触发 recv 超时按 no-anomaly 处理。e2e 用
+  `ETRACE_DIAG_MODEL_ANOMALY_TIMEOUT_MS=30000` 覆盖。
+- **场景结果**：cpu/io/lock 全通（TORAI 将 stress-ng/fio 进程排 rank=1，
+  severity 1.0/0.73/1.0）。**mem 场景灵敏度不足**（已知校准项）：
+  mem_avail 5.0→1.5GB、vm_pgfault 上升确认注入生效，但 fused_max≈0.2
+  < 0.25 门且 zn 平滑后未过 0.95 —— 短窗上 mem 通道 q99 锚定偏高，属
+  Time-RCD-Fuse 门限/窗口校准范围，留待在线数据累积后调参，非采集链路缺陷。
+- **ws_server 启动**：`python -m alg_models.ws_server` 需 `PYTHONPATH=src`
+  （模块自身 argparse 不接受 uvicorn 的 `--app-dir`）。
