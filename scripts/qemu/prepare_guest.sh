@@ -20,6 +20,12 @@ mkdir -p "$QEMU_DATA" "$(dirname "$ROOTFS")"
 exec > >(tee -a "$LOG") 2>&1
 
 ensure_host_deps
+# Never blind-wipe: if proc/sys/dev are still bind-mounted (crashed prior run),
+# rm -rf follows into the HOST /dev and destroys device nodes (observed:
+# host /dev/null became a regular file). Detach first, then wipe.
+if mountpoint -q "$ROOTFS/dev" || mountpoint -q "$ROOTFS/proc" || mountpoint -q "$ROOTFS/sys"; then
+  umount -l "$ROOTFS/dev" "$ROOTFS/proc" "$ROOTFS/sys" 2>/dev/null || true
+fi
 rm -rf "$ROOTFS"
 mkdir -p "$ROOTFS"
 
