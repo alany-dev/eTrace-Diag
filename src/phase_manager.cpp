@@ -33,6 +33,13 @@ void PhaseManager::EnterDeep(const Config& cfg, uint64_t now_ns) {
 }
 
 void PhaseManager::FinalizeDeep(const Config& cfg, uint64_t now_ns) {
+  // An open window (anomaly persists past the debounce threshold) is closed
+  // at finalize time: the evidence still covers the full anomalous interval,
+  // and a zero end_ts makes the causal model abstain ("no valid anomaly
+  // window"). Sustained-injection scenarios (e.g. a 90s fio run) never let
+  // end_debounce_samples fire, so close deterministically on deadline.
+  if (anomaly_end_ts_ == 0) anomaly_end_ts_ = now_ns;
+
   nlohmann::json summary;
   summary["v"] = 2;
   summary["anomaly_start_ts"] = anomaly_start_ts_;

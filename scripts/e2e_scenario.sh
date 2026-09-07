@@ -41,7 +41,7 @@ cleanup() {
 trap cleanup EXIT
 
 # 1. model WS server (warmup/stride per models/configs/e2e.yaml)
-(cd "$MODEL_DIR" && exec "$MODEL_PY" -m alg_models.ws_server \
+(cd "$MODEL_DIR" && PYTHONPATH=src exec "$MODEL_PY" -m alg_models.ws_server \
   --config configs/e2e.yaml --host 127.0.0.1 --port 9000) >"$OUT/ws_server.log" 2>&1 &
 WS_PID=$!
 for _ in $(seq 1 30); do
@@ -58,6 +58,7 @@ fi
 # 2. collector (BASE 全程；模型预热后打分，DEEP 由模型触发；post 窗口压到
 #    30s 让 DEEP 在注入结束后自然 finalize 并完成因果推理)
 ETRACE_DIAG_WINDOW_POST_ANOMALY_SECONDS=30 \
+ETRACE_DIAG_MODEL_ANOMALY_TIMEOUT_MS="${ETRACE_DIAG_MODEL_ANOMALY_TIMEOUT_MS:-30000}" \
 "$COLLECTOR" --config "$ROOT/config/default.json" --run-seconds "$RUN_SECONDS" \
   --output-dir "$OUT" >"$OUT/collector.log" 2>&1 &
 COL_PID=$!
