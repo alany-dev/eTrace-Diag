@@ -34,16 +34,24 @@ if(NOT ETD_CLANG)
 endif()
 message(STATUS "etrace-diag: using clang ${ETD_CLANG}")
 
-# Host architecture -> __TARGET_ARCH_* token for BPF compilation.
+# Host architecture -> __TARGET_ARCH_* token + per-arch BPF source selection.
+# Each arch has its own syscall-entry program (fentry/do_syscall_64 on x86,
+# tp_btf/sys_enter + sys_exit elsewhere); shared programs live in
+# bpf/etrace_common.h. Keeps per-arch register handling out of the shared file.
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64")
   set(ETD_BPF_ARCH_DEFINE -D__TARGET_ARCH_x86)
+  set(ETD_BPF_SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/bpf/etrace_x86.bpf.c)
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
   set(ETD_BPF_ARCH_DEFINE -D__TARGET_ARCH_arm64)
+  set(ETD_BPF_SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/bpf/etrace_arm64.bpf.c)
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "loongarch64|loong64")
   set(ETD_BPF_ARCH_DEFINE -D__TARGET_ARCH_loongarch)
+  set(ETD_BPF_SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/bpf/etrace_arm64.bpf.c)
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64")
   set(ETD_BPF_ARCH_DEFINE -D__TARGET_ARCH_riscv)
+  set(ETD_BPF_SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/bpf/etrace_arm64.bpf.c)
 else()
   message(WARNING "Unrecognized arch '${CMAKE_SYSTEM_PROCESSOR}'; defaulting to x86")
   set(ETD_BPF_ARCH_DEFINE -D__TARGET_ARCH_x86)
+  set(ETD_BPF_SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/bpf/etrace_x86.bpf.c)
 endif()

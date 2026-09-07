@@ -85,8 +85,8 @@ add_custom_command(
   COMMAND ${ETD_CLANG} -target bpf -O2 -g ${ETD_BPF_ARCH_DEFINE} -mcpu=v3
           -D__KERNEL__ ${ETD_BPF_EXTRA_DEFINES}
           ${ETD_BPF_INCLUDES}
-          -c ${ETD_BPF_DIR}/etrace.bpf.c -o ${BPF_OBJ}
-  DEPENDS ${ETD_BPF_DIR}/etrace.bpf.c ${VMLINUX_H} ${ETD_LIBBPF_LIBRARIES}
+          -c ${ETD_BPF_SOURCE} -o ${BPF_OBJ}
+  DEPENDS ${ETD_BPF_SOURCE} ${ETD_BPF_DIR}/etrace_common.h ${VMLINUX_H} ${ETD_LIBBPF_LIBRARIES}
   COMMENT "Compiling etrace.bpf.c -> etrace.bpf.o"
   VERBATIM)
 
