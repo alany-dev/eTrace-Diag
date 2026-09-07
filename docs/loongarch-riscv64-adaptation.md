@@ -30,3 +30,27 @@ C. 维持现状：matrix.sh 覆盖 x86_64/arm64 两架构实机；loong64/riscv6
    等上游内核开 BTF 后零改动接入
 
 当前采纳 C（代码就绪 + 文档记录），A 作为赛题演示的推荐增强。
+
+## openKylin 3.0 (huanghe) 实测（2026-09-07 追加）
+
+按"试试 openKylin 3.0"实测 huanghe 套件（架构列表 amd64 arm64 i386 loong64 riscv64 rv64g）：
+
+| 架构 | 内核包 | 版本 | BTF |
+|---|---|---|---|
+| loong64 | linux-image-6.6.0-20-generic | 6.6.0-20.0ok1 | **无**（config 无该行 + vmlinuz 解压扫描无有效 BTF 头） |
+| loong64 | linux-image-unsigned-7.0.0-2-generic (proposed) | 7.0.0-2.0ok7 | **无** |
+| riscv64 | linux-image-5.15.65-rt56+ | 5.15.65-rt56+-3 | **无**（且 <6.6） |
+
+验证方法：config-6.6.0-20/7.0.0-2 内 `CONFIG_DEBUG_INFO_BTF` 缺失；解压 vmlinuz
+（gzip 全量解压）扫描 BTF 魔数 0xEB9F + 合法头（ver=1, hdr_len∈{24,32}）均未命中；
+modules 包内亦无 *.btf。对照组：同机 x86_64 主机内核 7.0.0-2-generic 有 BTF
+（CONFIG_DEBUG_INFO_BTF=y，/sys/kernel/btf/vmlinux 7.08MB）。
+
+**结论：openKylin 官方源 loong64/riscv64 全系（2.0 nile 与 3.0 huanghe）均未启用
+BTF，属发行版内核构建策略，升级大版本无法解决。** 要跑通 loong64/riscv64 必须：
+1. 换带 BTF 的第三方内核（Debian trixie+ 内核 6.12/7.1 loong64/riscv64 均
+   默认 BTF；openEuler 24.03 loongarch 同），openKylin 用户态不动；或
+2. 重编 openKylin 内核（开 CONFIG_DEBUG_INFO_BTF）——需要上游源码与构建环境。
+
+bpf 代码层（etrace_loongarch64.bpf.c / etrace_riscv64.bpf.c）已就绪，内核一到位
+`matrix.sh loong64|riscv64` 即可复用全流程。
