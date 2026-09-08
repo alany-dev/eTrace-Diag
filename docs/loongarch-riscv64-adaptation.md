@@ -54,3 +54,31 @@ BTF，属发行版内核构建策略，升级大版本无法解决。** 要跑�
 
 bpf 代码层（etrace_loongarch64.bpf.c / etrace_riscv64.bpf.c）已就绪，内核一到位
 `matrix.sh loong64|riscv64` 即可复用全流程。
+
+## riscv64 实机验证通过（2026-09-08）
+
+**方案**：openKylin nile riscv64 用户态（debootstrap）+ **Debian trixie 内核
+linux-image-6.12.86+deb13-riscv64**（CONFIG_DEBUG_INFO_BTF=y，双内核来源中
+唯一带 BTF 的 riscv64 选项）+ OpenSBI fw_dynamic.bin + qemu-system-riscv64。
+
+关键点（踩坑记录）：
+1. **内核来源**：openKylin huanghe/nile riscv64 内核（5.15.65-rt56+）无 BTF 且 <6.6；
+   Debian trixie 6.12 riscv64 有完整 BTF（vmlinux 未压缩 ELF 附带，可直接
+   bpftool dump）。下载需断点续传（111MB deb，wget --continue 多轮）。
+2. **引导链**：riscv64 需 OpenSBI（opensbi_1.6-1_all.deb 提供 fw_dynamic.bin），
+   `-bios fw_dynamic.bin -kernel vmlinux.elf -initrd initrd.img`；UEFI PE
+   (vmlinuz) 会 ROM 重叠，fw_jump.elf 段 @0 与 mrom.reset 重叠，fw_dynamic.bin
+   (raw) 正确。
+3. **qemu-system-riscv64 二进制**：openKylin qemu-system-misc 缺 riscv64
+   模拟器，从 Debian trixie qemu-system-riscv_10.0.11 deb 提取二进制 +
+   libcapstone5/opensbi 补齐依赖，`QEMU_MODULE_DIR` 指向解包目录。
+4. **devpts 级联损伤**：guest rootfs 挂载 /dev 后 umount 时序问题会反复
+   stack /dev/pts 于宿主（此前 rm -rf 清 rootfs 还曾把宿主 /dev/null 变
+   普通文件）；每次 rootfs 操作后须清理嵌套挂载。prepare_guest.sh 已加
+   mountpoint 守卫（bbebe3a）。
+5. **用户坑**：riscv64 debootstrap 用户态无 `yang` 用户，ssh 尝试 yang 遭
+   Permission denied 数十轮——最终用 root:yang（chpasswd -c SHA512）成功。
+6. **root=/dev/vda**（make_disk 整盘单分区，非 /dev/vda1）。
+
+验证结果：multi-user 达、SSH 登录、6.12.86 内核 + BTF 确认。采集器 BPF
+加载待跑冒烟（与 arm64 同款 tp_btf/sys_enter 路径，内核 6.12 BTF 完备）。
